@@ -46,37 +46,70 @@ function fmtDisplay(value, decimals = 2) {
   return parseFloat(n.toFixed(decimals)).toString();
 }
 
-// --- Compute clean buy: round shares to 2 decimals, derive USDC from clean shares × price ---
-// This ensures both sides are CLOB-compatible:
-//   shares: 2 decimals (well within 6 decimal limit)
-//   USDC:   2 decimals (within 2 decimal limit)
-function computeCleanBuy(targetAmount, price) {
-  const p = parseFloat(price);
-  if (!p || p <= 0) {
-    console.log(`[computeCleanBuy] invalid price: ${price}`);
-    return { amount: roundAmount(targetAmount), shares: null, adjusted: false };
+// --- THE FIX: round price to 2 decimals, find clean USDC amount that produces integer shares ---
+// CLOB requires: maker amount (USDC) max 2 decimals, taker amount (shares) max 6 decimals
+// If price has >2 decimals (e.g. 0.8825), shares = USDC/price will have >6 decimals
+// Solution: round price to 2 decimals via --max-price, then find USDC where shares is clean
+//
+// Math: price P (2 decimals) = p/100 where p is integer (e.g. 0.88 → p=88)
+//       amount A (2 decimals) = a/100 where a is integer (e.g. $1.76 → a=176)
+//       shares = A/P = (a/100)/(p/100) = a/p
+//       For shares to have ≤6 decimals: a * 1e6 mod p == 0
+function computeCleanBuyWithRoundedPrice(targetAmount, rawPrice) {
+  const target = roundAmount(targetAmount);
+  const targetCents = Math.round(target * 100); // integer cents
+
+  // Try rounding price to 2 decimals in both directions (floor and ceil)
+  const priceFloor = Math.floor(parseFloat(rawPrice) * 100) / 100;
+  const priceCeil = Math.ceil(parseFloat(rawPrice) * 100) / 100;
+
+  console.log(`[computeCleanBuy] target=$${target.toFixed(2)}, rawPrice=${rawPrice}, floor=${priceFloor}, ceil=${priceCeil}`);
+
+  // Try both rounded prices, find the one with a clean amount closest to target
+  const candidates = [];
+
+  for (const roundedPrice of [priceFloor, priceCeil]) {
+    if (roundedPrice <= 0 || roundedPrice >= 1) continue;
+
+    const p = Math.round(roundedPrice * 100); // integer price in cents
+
+    // Check if target itself is clean
+    if ((targetCents * 1e6) % p === 0) {
+      const shares = targetCents / p;
+      console.log(`[computeCleanBuy] EXACT: price=${roundedPrice}, $${target.toFixed(2)} → ${shares} shares`);
+      candidates.push({ amount: target, price: roundedPrice, shares, adjusted: false, distance: 0 });
+      continue;
+    }
+
+    // Search outward in 1-cent increments for a clean amount
+    for (let delta = 1; delta <= 10000; delta++) {
+      for (const sign of [1, -1]) {
+        const testCents = targetCents + sign * delta;
+        if (testCents <= 0) continue;
+        if ((testCents * 1e6) % p === 0) {
+          const testAmount = testCents / 100;
+          const shares = testCents / p;
+          console.log(`[computeCleanBuy] FOUND: price=${roundedPrice}, $${testAmount.toFixed(2)} → ${shares} shares (delta=${sign * delta}¢)`);
+          candidates.push({ amount: testAmount, price: roundedPrice, shares, adjusted: true, distance: delta });
+          break;
+        }
+      }
+      // If we found a candidate for this price, stop searching
+      if (candidates.some(c => c.price === roundedPrice)) break;
+    }
   }
 
-  const targetUsd = roundAmount(targetAmount);
-  const rawShares = targetUsd / p;
-  console.log(`[computeCleanBuy] target=$${targetUsd.toFixed(2)}, price=${p}, rawShares=${rawShares}`);
+  if (candidates.length === 0) {
+    console.log(`[computeCleanBuy] NO clean amount found, falling back to original`);
+    return { amount: target, price: null, shares: null, adjusted: false };
+  }
 
-  // Round shares to 2 decimals
-  const cleanShares = Math.round(rawShares * 100) / 100;
-  console.log(`[computeCleanBuy] cleanShares=${cleanShares} (rounded from ${rawShares})`);
+  // Pick the candidate closest to the target amount
+  candidates.sort((a, b) => a.distance - b.distance);
+  const best = candidates[0];
+  console.log(`[computeCleanBuy] BEST: price=${best.price}, $${best.amount.toFixed(2)} → ${best.shares} shares (distance=${best.distance}¢)`);
 
-  // Compute USDC from clean shares × price
-  const cleanUsd = roundAmount(cleanShares * p);
-  console.log(`[computeCleanBuy] cleanUsd=$${cleanUsd.toFixed(2)} (= ${cleanShares} × ${p})`);
-
-  // Verify: cleanUsd / p should give back cleanShares (within tolerance)
-  const verifyShares = cleanUsd / p;
-  const verifyRounded = Math.round(verifyShares * 1e6) / 1e6;
-  const isClean = Math.abs(verifyShares - verifyRounded) < 1e-9;
-  console.log(`[computeCleanBuy] verify: ${cleanUsd}/${p} = ${verifyShares}, rounded=${verifyRounded}, clean=${isClean}`);
-
-  const adjusted = Math.abs(cleanUsd - targetUsd) > 0.01;
-  return { amount: cleanUsd, shares: cleanShares, adjusted };
+  return best;
 }
 
 // --- Auto-detect bullpen binary path ---
@@ -229,7 +262,7 @@ function parseBullpenResult(stdout) {
   }
 }
 
-// --- Extract price from bullpen output (try every possible field) ---
+// --- Extract price from bullpen output ---
 function extractPrice(stdout) {
   const data = parseBullpenResult(stdout);
   if (data) {
@@ -293,11 +326,11 @@ function extractTradeInfo(stdout) {
   if (data) {
     return {
       price: data.price || data.avg_price || data.fill_price || data.execution_price || null,
-      amount: data.amount || data.size || data.cost || data.usdc || data.spent || null,
+      amount: data.amount || data.size || data.cost || data.usdc || data.spent || data.amount_usd || null,
       shares: data.shares || data.fill_amount || data.filled || data.est_shares || data.estimated_shares || data.amount_bought || null,
       potential: data.potential || data.potential_payout || data.payout || null,
       spread: data.spread || null,
-      market: data.market || data.market_slug || data.slug || null,
+      market: data.market || data.market_slug || data.slug || data.market_title || null,
       outcome: data.outcome || data.side || null,
       orderId: data.order_id || data.id || data.tx || data.tx_hash || null,
       status: data.status || null,
@@ -600,7 +633,7 @@ function isDecimalError(result) {
   return text.includes('decimal') || text.includes('invalid amounts') || text.includes('max accuracy');
 }
 
-// --- Interactive buy: preview, wait for "y", then execute with clean shares ---
+// --- Interactive buy: preview, wait for "y", then execute with clean amounts ---
 async function doBuyWithConfirm(msg, slug, outcome, amount, maxPrice, marketLabel) {
   await msg.channel.sendTyping();
   const previewResult = await previewBuy(slug, outcome, amount, maxPrice);
@@ -615,35 +648,35 @@ async function doBuyWithConfirm(msg, slug, outcome, amount, maxPrice, marketLabe
     return;
   }
 
-  // Extract price from preview to compute clean buy
+  // Extract price from preview
   const previewPrice = extractPrice(previewResult.stdout);
   const previewShares = extractShares(previewResult.stdout);
 
   console.log(`[doBuyWithConfirm] extracted price=${previewPrice}, shares=${previewShares}`);
 
+  // THE FIX: round price to 2 decimals, find clean USDC amount
   let execAmount = amount;
-  let adjustedMsg = '';
+  let execMaxPrice = maxPrice;
 
   if (previewPrice) {
-    // Round shares to 2 decimals, compute USDC from clean shares × price
-    const clean = computeCleanBuy(amount, previewPrice);
+    const clean = computeCleanBuyWithRoundedPrice(amount, previewPrice);
     execAmount = clean.amount;
+    execMaxPrice = clean.price; // Always use rounded price as max-price
 
     if (clean.adjusted) {
-      adjustedMsg = `⚠️ Adjusted to ${clean.shares} shares ($${fmtAmount(execAmount)}) for CLOB precision.`;
-      console.log(`[doBuyWithConfirm] ${adjustedMsg}`);
-      await msg.channel.send(adjustedMsg);
-    } else {
-      console.log(`[doBuyWithConfirm] original amount is already clean, no adjustment needed`);
+      await msg.channel.send(`⚠️ Adjusted for CLOB precision: $${fmtAmount(clean.amount)} at ${fmtPrice(clean.price)} → ${fmtDisplay(clean.shares, 6)} shares (clean).`);
+    } else if (clean.price && clean.price !== previewPrice) {
+      await msg.channel.send(`⚠️ Using rounded price ${fmtPrice(clean.price)} (was ${previewPrice}) for CLOB precision.`);
     }
+    console.log(`[doBuyWithConfirm] exec: amount=$${fmtAmount(execAmount)}, maxPrice=${execMaxPrice}`);
   } else {
-    console.log(`[doBuyWithConfirm] could not extract price from preview, skipping clean calculation`);
+    console.log(`[doBuyWithConfirm] could not extract price, using original amount and maxPrice`);
   }
 
   await msg.channel.send(`Type **y** to confirm this trade, or anything else to cancel (${confirmTimeoutSec}s timeout)...`);
 
   const confirmKey = msg.author.id;
-  pendingConfirms.set(confirmKey, { slug, outcome, amount: execAmount, maxPrice, marketLabel, channelId: msg.channelId });
+  pendingConfirms.set(confirmKey, { slug, outcome, amount: execAmount, maxPrice: execMaxPrice, marketLabel, channelId: msg.channelId });
 
   try {
     const collected = await msg.channel.awaitMessages({
@@ -659,41 +692,37 @@ async function doBuyWithConfirm(msg, slug, outcome, amount, maxPrice, marketLabe
     if (response.content.trim().toLowerCase() === 'y' || response.content.trim().toLowerCase() === 'yes') {
       await msg.channel.send('⏳ Executing trade...');
 
-      // Attempt 1: clean amount (from rounded shares) with maxPrice (if specified)
-      console.log(`[doBuyWithConfirm] attempt 1: amount=$${fmtAmount(execAmount)}, maxPrice=${maxPrice}`);
-      let execResult = await executeBuy(slug, outcome, execAmount, maxPrice);
+      // Attempt 1: clean amount with rounded max-price
+      console.log(`[doBuyWithConfirm] attempt 1: amount=$${fmtAmount(execAmount)}, maxPrice=${execMaxPrice}`);
+      let execResult = await executeBuy(slug, outcome, execAmount, execMaxPrice);
 
-      // Attempt 2: if decimal error, try clean amount WITHOUT maxPrice
+      // Attempt 2: if decimal error, try without max-price
       if (!execResult.ok && isDecimalError(execResult)) {
         console.log(`[doBuyWithConfirm] attempt 1 failed with decimal error, retrying without --max-price`);
         await msg.channel.send('⚠️ Retrying without price limit...');
         execResult = await executeBuy(slug, outcome, execAmount, null);
       }
 
-      // Attempt 3: if still decimal error, try original amount without maxPrice
+      // Attempt 3: try original amount with rounded max-price
       if (!execResult.ok && isDecimalError(execResult)) {
-        console.log(`[doBuyWithConfirm] attempt 2 failed, trying original amount $${fmtAmount(amount)} without maxPrice`);
+        console.log(`[doBuyWithConfirm] attempt 2 failed, trying original amount $${fmtAmount(amount)} with maxPrice=${execMaxPrice}`);
         await msg.channel.send('⚠️ Retrying with original amount...');
+        execResult = await executeBuy(slug, outcome, amount, execMaxPrice);
+      }
+
+      // Attempt 4: try original amount without max-price
+      if (!execResult.ok && isDecimalError(execResult)) {
+        console.log(`[doBuyWithConfirm] attempt 3 failed, trying original amount without maxPrice`);
         execResult = await executeBuy(slug, outcome, amount, null);
       }
 
-      // Attempt 4: try computing from preview shares directly (round to 2 decimals)
-      if (!execResult.ok && isDecimalError(execResult) && previewPrice && previewShares) {
-        const roundedShares = Math.round(previewShares * 100) / 100;
-        const computedAmount = roundAmount(roundedShares * previewPrice);
-        console.log(`[doBuyWithConfirm] attempt 3 failed, trying computed amount $${computedAmount} from rounded shares ${roundedShares}`);
-        await msg.channel.send(`⚠️ Retrying with ${roundedShares} shares ($${fmtAmount(computedAmount)})...`);
-        execResult = await executeBuy(slug, outcome, computedAmount, null);
-      }
-
-      // Attempt 5: try even simpler — just round shares to 1 decimal
+      // Attempt 5: try with ceil price instead of floor
       if (!execResult.ok && isDecimalError(execResult) && previewPrice) {
-        const rawShares = roundAmount(amount) / previewPrice;
-        const simpleShares = Math.round(rawShares * 10) / 10; // 1 decimal
-        const simpleAmount = roundAmount(simpleShares * previewPrice);
-        console.log(`[doBuyWithConfirm] attempt 4 failed, trying ${simpleShares} shares ($${simpleAmount})`);
-        await msg.channel.send(`⚠️ Retrying with ${simpleShares} shares ($${fmtAmount(simpleAmount)})...`);
-        execResult = await executeBuy(slug, outcome, simpleAmount, null);
+        const ceilPrice = Math.ceil(parseFloat(previewPrice) * 100) / 100;
+        console.log(`[doBuyWithConfirm] attempt 4 failed, trying with ceil price ${ceilPrice}`);
+        const clean2 = computeCleanBuyWithRoundedPrice(amount, ceilPrice);
+        await msg.channel.send(`⚠️ Retrying with $${fmtAmount(clean2.amount)} at ${fmtPrice(clean2.price)}...`);
+        execResult = await executeBuy(slug, outcome, clean2.amount, clean2.price);
       }
 
       const execEmbed = buildTradeEmbed({ slug, market: marketLabel, outcome, amount: execAmount }, execResult);
