@@ -29,6 +29,11 @@ function roundAmount(amount) {
   return Math.round(parseFloat(amount) * 100) / 100;
 }
 
+// --- Format amount as string with exactly 2 decimals ---
+function fmtAmount(amount) {
+  return roundAmount(amount).toFixed(2);
+}
+
 // --- Auto-detect bullpen binary path ---
 let resolvedBin = BULLPEN_BIN;
 async function resolveBullpenPath() {
@@ -76,7 +81,7 @@ const client = new Client({
   ],
 });
 
-// --- Track pending confirmations: userId -> { slug, outcome, amount, maxPrice, marketLabel } ---
+// --- Track pending confirmations ---
 const pendingConfirms = new Map();
 
 // --- Extract slug from Polymarket URL ---
@@ -141,8 +146,7 @@ async function searchMarket(query) {
 
 // --- Preview buy (no money moves) ---
 async function previewBuy(slug, outcome, amount, maxPrice) {
-  const rounded = roundAmount(amount);
-  const args = ['trade', 'buy', slug, outcome, rounded.toFixed(2)];
+  const args = ['polymarket', 'buy', slug, outcome, fmtAmount(amount)];
   if (maxPrice) args.push('--max-price', String(maxPrice));
   args.push('--preview', '--output', 'json');
   return runBullpen(args);
@@ -150,8 +154,7 @@ async function previewBuy(slug, outcome, amount, maxPrice) {
 
 // --- Execute buy (real trade) ---
 async function executeBuy(slug, outcome, amount, maxPrice) {
-  const rounded = roundAmount(amount);
-  const args = ['trade', 'buy', slug, outcome, rounded.toFixed(2)];
+  const args = ['polymarket', 'buy', slug, outcome, fmtAmount(amount)];
   if (maxPrice) args.push('--max-price', String(maxPrice));
   args.push('--yes', '--output', 'json');
   return runBullpen(args);
@@ -159,11 +162,10 @@ async function executeBuy(slug, outcome, amount, maxPrice) {
 
 // --- Sell shares ---
 async function sellShares(slug, outcome, maxShares, preview) {
-  const args = ['trade', 'sell', slug, outcome];
+  const args = ['polymarket', 'sell', slug, outcome];
   if (maxShares === 'max') args.push('--max');
   else if (maxShares) {
-    const rounded = roundAmount(maxShares);
-    args.push(rounded.toFixed(2));
+    args.push(fmtAmount(maxShares));
   }
   if (preview) args.push('--preview');
   else args.push('--yes');
@@ -249,7 +251,7 @@ function buildPreviewEmbed(cmd, result) {
   embed.addFields(
     { name: 'Market', value: `\`${String(market).slice(0, 100)}\``, inline: true },
     { name: 'Outcome', value: String(outcome), inline: true },
-    { name: 'Amount', value: amount !== 'N/A' ? `$${amount}` : `$${roundAmount(cmd.amount).toFixed(2)}`, inline: true },
+    { name: 'Amount', value: amount !== 'N/A' ? `$${amount}` : `$${fmtAmount(cmd.amount)}`, inline: true },
   );
 
   if (info.price) embed.addFields({ name: 'Price', value: `${info.price}¢`, inline: true });
@@ -291,7 +293,7 @@ function buildTradeEmbed(cmd, result) {
   embed.addFields(
     { name: 'Market', value: `\`${String(market).slice(0, 100)}\``, inline: true },
     { name: 'Outcome', value: String(outcome), inline: true },
-    { name: 'Spent', value: amount !== 'N/A' ? `$${amount}` : `$${roundAmount(cmd.amount).toFixed(2)}`, inline: true },
+    { name: 'Spent', value: amount !== 'N/A' ? `$${amount}` : `$${fmtAmount(cmd.amount)}`, inline: true },
   );
 
   if (info.shares) embed.addFields({ name: 'Shares', value: String(info.shares), inline: true });
@@ -430,64 +432,45 @@ function formatPositionsSummary(result) {
 function parseCommand(content) {
   const t = content.trim();
 
-  // ==========================================
   // NATURAL LANGUAGE (no ! prefix needed)
-  // ==========================================
-
-  // Buy "Rinderknech" on Polymarket: https://polymarket.com/event/... for $10
   let m = t.match(/^Buy\s+"([^"]+)"\s+on\s+Polymarket:?\s+(https?:\/\/\S+)\s+for\s+\$([\d.]+)/i);
   if (m) return { type: 'buy-url', outcome: m[1], url: m[2], amount: parseFloat(m[3]), maxPrice: null, natural: true };
 
-  // Buy $10 of "Rinderknech" on Polymarket: https://polymarket.com/event/...
   m = t.match(/^Buy\s+\$([\d.]+)\s+of\s+"([^"]+)"\s+on\s+Polymarket:?\s+(https?:\/\/\S+)/i);
   if (m) return { type: 'buy-url', outcome: m[2], url: m[3], amount: parseFloat(m[1]), maxPrice: null, natural: true };
 
-  // Buy "Rinderknech" on Polymarket: https://polymarket.com/event/...
   m = t.match(/^Buy\s+"([^"]+)"\s+on\s+Polymarket:?\s+(https?:\/\/\S+)/i);
   if (m) return { type: 'buy-url', outcome: m[1], url: m[2], amount: parseFloat(DEFAULT_BUY_AMOUNT), maxPrice: null, natural: true };
 
-  // ==========================================
-  // ! COMMANDS (require ! prefix)
-  // ==========================================
   if (!t.startsWith('!')) return null;
 
-  // !buy-url <url> <outcome> <amount> [--max-price 0.20]
   m = t.match(/^!buy-url\s+(https?:\/\/\S+)\s+(\w+)\s+([\d.]+)(?:\s+--max-price\s+([\d.]+))?$/i);
   if (m) return { type: 'buy-url', url: m[1], outcome: m[2].toUpperCase(), amount: parseFloat(m[3]), maxPrice: m[4] ? parseFloat(m[4]) : null };
 
-  // !buy "Rinderknech" https://polymarket.com/event/... 10 [--max-price 0.20]
   m = t.match(/^!buy\s+"([^"]+)"\s+(https?:\/\/\S+)\s+([\d.]+)(?:\s+--max-price\s+([\d.]+))?$/i);
   if (m) return { type: 'buy-url', outcome: m[1].toUpperCase(), url: m[2], amount: parseFloat(m[3]), maxPrice: m[4] ? parseFloat(m[4]) : null };
 
-  // !buy "Market Name" YES 10 [--max-price 0.20]
   m = t.match(/^!buy\s+"([^"]+)"\s+(\w+)\s+([\d.]+)(?:\s+--max-price\s+([\d.]+))?$/i);
   if (m) return { type: 'buy', market: m[1], outcome: m[2].toUpperCase(), amount: parseFloat(m[3]), maxPrice: m[4] ? parseFloat(m[4]) : null };
 
-  // !buy Market Name YES 10 (no quotes)
   m = t.match(/^!buy\s+(.+?)\s+(\w+)\s+([\d.]+)(?:\s+--max-price\s+([\d.]+))?$/i);
   if (m) return { type: 'buy', market: m[1].trim(), outcome: m[2].toUpperCase(), amount: parseFloat(m[3]), maxPrice: m[4] ? parseFloat(m[4]) : null };
 
-  // !buy-slug market-slug YES 10 [--max-price 0.20]
   m = t.match(/^!buy-slug\s+(\S+)\s+(\w+)\s+([\d.]+)(?:\s+--max-price\s+([\d.]+))?$/i);
   if (m) return { type: 'buy-slug', slug: m[1], outcome: m[2].toUpperCase(), amount: parseFloat(m[3]), maxPrice: m[4] ? parseFloat(m[4]) : null };
 
-  // !preview "Market Name" YES 10 [--max-price 0.20]
   m = t.match(/^!preview\s+"([^"]+)"\s+(\w+)\s+([\d.]+)(?:\s+--max-price\s+([\d.]+))?$/i);
   if (m) return { type: 'preview', market: m[1], outcome: m[2].toUpperCase(), amount: parseFloat(m[3]), maxPrice: m[4] ? parseFloat(m[4]) : null };
 
-  // !preview-slug market-slug YES 10 [--max-price 0.20]
   m = t.match(/^!preview-slug\s+(\S+)\s+(\w+)\s+([\d.]+)(?:\s+--max-price\s+([\d.]+))?$/i);
   if (m) return { type: 'preview-slug', slug: m[1], outcome: m[2].toUpperCase(), amount: parseFloat(m[3]), maxPrice: m[4] ? parseFloat(m[4]) : null };
 
-  // !sell "Market Name" YES [max|amount] [--preview]
   m = t.match(/^!sell\s+"([^"]+)"\s+(\w+)(?:\s+(max|[\d.]+))?(?:\s+--preview)?$/i);
   if (m) return { type: 'sell', market: m[1], outcome: m[2].toUpperCase(), sellAmount: m[3] || 'max', preview: /--preview/i.test(t) };
 
-  // !sell-slug market-slug YES [max|amount] [--preview]
   m = t.match(/^!sell-slug\s+(\S+)\s+(\w+)(?:\s+(max|[\d.]+))?(?:\s+--preview)?$/i);
   if (m) return { type: 'sell-slug', slug: m[1], outcome: m[2].toUpperCase(), sellAmount: m[3] || 'max', preview: /--preview/i.test(t) };
 
-  // !search bitcoin
   m = t.match(/^!search\s+(.+)$/i);
   if (m) return { type: 'search', query: m[1] };
 
@@ -499,7 +482,6 @@ function parseCommand(content) {
   return null;
 }
 
-// --- Build embed from summary ---
 function buildEmbedFromSummary(summary) {
   const embed = new EmbedBuilder().setTimestamp();
   embed.setColor(summary.color).setTitle(summary.title);
@@ -509,27 +491,21 @@ function buildEmbedFromSummary(summary) {
 
 // --- Interactive buy: preview, wait for "y", then execute ---
 async function doBuyWithConfirm(msg, slug, outcome, amount, maxPrice, marketLabel) {
-  // Phase 1: Preview
   await msg.channel.sendTyping();
   const previewResult = await previewBuy(slug, outcome, amount, maxPrice);
 
-  // Show preview embed (even if preview failed, show the error)
   const previewEmbed = buildPreviewEmbed({ slug, market: marketLabel, outcome, amount }, previewResult);
   await msg.channel.send({ embeds: [previewEmbed] });
 
-  // If preview failed, don't wait for confirmation
   if (!previewResult.ok) {
     return;
   }
 
-  // Phase 2: Wait for user confirmation
   await msg.channel.send(`Type **y** to confirm this trade, or anything else to cancel (${confirmTimeoutSec}s timeout)...`);
 
-  // Store pending confirmation
   const confirmKey = msg.author.id;
   pendingConfirms.set(confirmKey, { slug, outcome, amount, maxPrice, marketLabel, channelId: msg.channelId });
 
-  // Use awaitMessages to wait for the user's response
   try {
     const collected = await msg.channel.awaitMessages({
       filter: (m) => m.author.id === msg.author.id,
@@ -542,7 +518,6 @@ async function doBuyWithConfirm(msg, slug, outcome, amount, maxPrice, marketLabe
     pendingConfirms.delete(confirmKey);
 
     if (response.content.trim().toLowerCase() === 'y' || response.content.trim().toLowerCase() === 'yes') {
-      // Phase 3: Execute the trade
       await msg.channel.send('⏳ Executing trade...');
       const execResult = await executeBuy(slug, outcome, amount, maxPrice);
       const execEmbed = buildTradeEmbed({ slug, market: marketLabel, outcome, amount }, execResult);
@@ -551,7 +526,6 @@ async function doBuyWithConfirm(msg, slug, outcome, amount, maxPrice, marketLabe
       await msg.channel.send('❌ Trade cancelled.');
     }
   } catch (err) {
-    // Timeout
     pendingConfirms.delete(confirmKey);
     await msg.channel.send('⏰ Trade cancelled — confirmation timed out.');
   }
@@ -562,12 +536,8 @@ client.on('messageCreate', async (msg) => {
   if (msg.author.bot) return;
   if (msg.channelId !== TRADE_CHANNEL_ID) return;
 
-  // Check if this is a confirmation response for a pending trade
   const pending = pendingConfirms.get(msg.author.id);
-  if (pending) {
-    // awaitMessages in doBuyWithConfirm handles this — skip normal command parsing
-    return;
-  }
+  if (pending) return;
 
   const cmd = parseCommand(msg.content);
   if (!cmd) return;
@@ -677,16 +647,13 @@ client.on('messageCreate', async (msg) => {
           break;
         }
 
-        await msg.reply(`Found ${extracted.type} slug: \`${extracted.slug}\`. Previewing buy **${cmd.outcome}** for $${roundAmount(cmd.amount).toFixed(2)}${cmd.maxPrice ? ` (max price $${cmd.maxPrice})` : ''}...`);
+        await msg.reply(`Found ${extracted.type} slug: \`${extracted.slug}\`. Previewing buy **${cmd.outcome}** for $${fmtAmount(cmd.amount)}${cmd.maxPrice ? ` (max price $${cmd.maxPrice})` : ''}...`);
 
-        // Try direct slug first
         const previewResult = await previewBuy(extracted.slug, cmd.outcome, cmd.amount, cmd.maxPrice);
 
         if (previewResult.ok) {
-          // Preview worked — do interactive confirm flow
           await doBuyWithConfirm(msg, extracted.slug, cmd.outcome, cmd.amount, cmd.maxPrice, extracted.slug);
         } else {
-          // Direct slug preview failed — try searching for the market
           await msg.channel.send('Direct slug failed, searching for specific market...');
           const searchResult = await searchMarket(extracted.slug);
           if (searchResult.ok && searchResult.markets.length > 0) {
@@ -699,7 +666,6 @@ client.on('messageCreate', async (msg) => {
             await msg.channel.send(`Found market: **${title}** (slug: \`${slug}\`)`);
             await doBuyWithConfirm(msg, slug, cmd.outcome, cmd.amount, cmd.maxPrice, title);
           } else {
-            // Search also failed — try previewing directly with the original slug
             await msg.channel.send('Search failed too. Attempting direct preview...');
             await doBuyWithConfirm(msg, extracted.slug, cmd.outcome, cmd.amount, cmd.maxPrice, extracted.slug);
           }
@@ -734,7 +700,7 @@ client.on('messageCreate', async (msg) => {
 
       case 'preview-slug': {
         await msg.channel.sendTyping();
-        await msg.reply(`Previewing: buy ${cmd.outcome} on \`${cmd.slug}\` for $${roundAmount(cmd.amount).toFixed(2)}${cmd.maxPrice ? ` (max price $${cmd.maxPrice})` : ''}...`);
+        await msg.reply(`Previewing: buy ${cmd.outcome} on \`${cmd.slug}\` for $${fmtAmount(cmd.amount)}${cmd.maxPrice ? ` (max price $${cmd.maxPrice})` : ''}...`);
         const result = await previewBuy(cmd.slug, cmd.outcome, cmd.amount, cmd.maxPrice);
         const embed = buildPreviewEmbed({ ...cmd, market: cmd.slug }, result);
         await msg.channel.send({ embeds: [embed] });
@@ -756,7 +722,7 @@ client.on('messageCreate', async (msg) => {
           break;
         }
         const title = first.title || first.question || first.name || slug;
-        await msg.channel.send(`Found: **${title}** (slug: \`${slug}\`). Previewing buy ${cmd.outcome} for $${roundAmount(cmd.amount).toFixed(2)}...`);
+        await msg.channel.send(`Found: **${title}** (slug: \`${slug}\`). Previewing buy ${cmd.outcome} for $${fmtAmount(cmd.amount)}...`);
         const result = await previewBuy(slug, cmd.outcome, cmd.amount, cmd.maxPrice);
         const embed = buildPreviewEmbed({ ...cmd, slug, market: title }, result);
         await msg.channel.send({ embeds: [embed] });
