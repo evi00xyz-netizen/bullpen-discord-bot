@@ -14,6 +14,7 @@ const {
   BULLPEN_HOME,
   BULLPEN_ENV = 'production',
   BULLPEN_USE_WSL = 'false',
+  DEFAULT_BUY_AMOUNT = '5',
 } = process.env;
 
 if (!DISCORD_BOT_TOKEN) { console.error('Missing DISCORD_BOT_TOKEN'); process.exit(1); }
@@ -130,7 +131,6 @@ async function searchMarket(query) {
 
 // --- Buy shares ---
 // bullpen trade buy <MARKET_SLUG> <outcome> <amount> --yes --output json
-// bullpen trade buy <MARKET_SLUG> <outcome> <amount> --max-price 0.20 --yes --output json
 async function buyShares(slug, outcome, amount, maxPrice) {
   const args = ['trade', 'buy', slug, outcome, String(amount)];
   if (maxPrice) args.push('--max-price', String(maxPrice));
@@ -138,8 +138,7 @@ async function buyShares(slug, outcome, amount, maxPrice) {
   return runBullpen(args);
 }
 
-// --- Preview buy (no money moves) ---
-// bullpen trade buy <MARKET_SLUG> <outcome> <amount> --preview --output json
+// --- Preview buy ---
 async function previewBuy(slug, outcome, amount, maxPrice) {
   const args = ['trade', 'buy', slug, outcome, String(amount)];
   if (maxPrice) args.push('--max-price', String(maxPrice));
@@ -148,8 +147,6 @@ async function previewBuy(slug, outcome, amount, maxPrice) {
 }
 
 // --- Sell shares ---
-// bullpen trade sell <MARKET_SLUG> <outcome> --max --yes --output json
-// bullpen trade sell <MARKET_SLUG> <outcome> --max --preview --output json
 async function sellShares(slug, outcome, maxShares, preview) {
   const args = ['trade', 'sell', slug, outcome];
   if (maxShares === 'max') args.push('--max');
@@ -165,8 +162,30 @@ function parseCommand(content) {
   const t = content.trim();
   if (!t.startsWith('!')) return null;
 
+  // ==========================================
+  // NATURAL LANGUAGE: Buy "Rinderknech" on Polymarket: https://polymarket.com/event/...
+  // ==========================================
+  let m = t.match(/^!?\s*Buy\s+"([^"]+)"\s+on\s+Polymarket:?\s+(https?:\/\/\S+)/i);
+  if (m) {
+    return { type: 'buy-url', outcome: m[1], url: m[2], amount: parseFloat(DEFAULT_BUY_AMOUNT), maxPrice: null, natural: true };
+  }
+
+  // Buy "Rinderknech" on Polymarket: https://polymarket.com/event/... for $10
+  m = t.match(/^!?\s*Buy\s+"([^"]+)"\s+on\s+Polymarket:?\s+(https?:\/\/\S+)\s+for\s+\$([\d.]+)/i);
+  if (m) {
+    return { type: 'buy-url', outcome: m[1], url: m[2], amount: parseFloat(m[3]), maxPrice: null, natural: true };
+  }
+
+  // Buy $10 of "Rinderknech" on Polymarket: https://polymarket.com/event/...
+  m = t.match(/^!?\s*Buy\s+\$([\d.]+)\s+of\s+"([^"]+)"\s+on\s+Polymarket:?\s+(https?:\/\/\S+)/i);
+  if (m) {
+    return { type: 'buy-url', outcome: m[2], url: m[3], amount: parseFloat(m[1]), maxPrice: null, natural: true };
+  }
+
+  // ==========================================
   // !buy-url <url> <outcome> <amount> [--max-price 0.20]
-  let m = t.match(/^!buy-url\s+(https?:\/\/\S+)\s+(\w+)\s+([\d.]+)(?:\s+--max-price\s+([\d.]+))?$/i);
+  // ==========================================
+  m = t.match(/^!buy-url\s+(https?:\/\/\S+)\s+(\w+)\s+([\d.]+)(?:\s+--max-price\s+([\d.]+))?$/i);
   if (m) return { type: 'buy-url', url: m[1], outcome: m[2].toUpperCase(), amount: parseFloat(m[3]), maxPrice: m[4] ? parseFloat(m[4]) : null };
 
   // !buy "Rinderknech" https://polymarket.com/event/... 10 [--max-price 0.20]
@@ -259,6 +278,11 @@ client.on('messageCreate', async (msg) => {
     switch (cmd.type) {
       case 'help': {
         await msg.reply({ embeds: [new EmbedBuilder().setColor(0x3498db).setTitle('Bullpen Discord Bot Commands').setDescription([
+          '**Natural Language (just paste it):**',
+          '`Buy "Rinderknech" on Polymarket: https://polymarket.com/event/...` — Buy $' + DEFAULT_BUY_AMOUNT + ' (default)',
+          '`Buy "Rinderknech" on Polymarket: https://polymarket.com/event/... for $10` — Buy $10',
+          '`Buy $10 of "Rinderknech" on Polymarket: https://polymarket.com/event/...` — Buy $10',
+          '',
           '**Buying:**',
           '`!buy "Market Name" YES 10` — Buy $10 of YES (auto-searches)',
           '`!buy "Market Name" YES 10 --max-price 0.20` — Buy with max price limit',
@@ -282,6 +306,8 @@ client.on('messageCreate', async (msg) => {
           '`!positions` — View your Polymarket positions',
           '`!debug` — Show bot debug info',
           '`!help` — Show this help',
+          '',
+          `Default buy amount: $${DEFAULT_BUY_AMOUNT} (set DEFAULT_BUY_AMOUNT in .env)`,
         ].join('\n'))] });
         break;
       }
@@ -294,6 +320,7 @@ client.on('messageCreate', async (msg) => {
           { name: 'resolvedBin', value: resolvedBin, inline: true },
           { name: 'BULLPEN_USE_WSL', value: String(useWsl), inline: true },
           { name: 'BULLPEN_HOME', value: BULLPEN_HOME || '(not set)', inline: true },
+          { name: 'DEFAULT_BUY_AMOUNT', value: DEFAULT_BUY_AMOUNT, inline: true },
           { name: 'PATH', value: '```' + (process.env.PATH || '').slice(0, 500) + '```' },
         );
         const verResult = await runBullpen(['--version']);
@@ -486,6 +513,7 @@ client.once('ready', async () => {
   if (useWsl) console.log('WSL2 mode: bullpen commands routed through `wsl -e bullpen`');
   resolvedBin = await resolveBullpenPath();
   console.log(`Using bullpen binary: ${resolvedBin}`);
+  console.log(`Default buy amount: $${DEFAULT_BUY_AMOUNT}`);
 });
 
 client.login(DISCORD_BOT_TOKEN);
