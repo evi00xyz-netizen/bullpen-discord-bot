@@ -12,10 +12,13 @@ const {
   BULLPEN_BIN = 'bullpen',
   BULLPEN_HOME,
   BULLPEN_ENV = 'production',
+  BULLPEN_USE_WSL = 'false',
 } = process.env;
 
 if (!DISCORD_BOT_TOKEN) { console.error('Missing DISCORD_BOT_TOKEN'); process.exit(1); }
 if (!TRADE_CHANNEL_ID) { console.error('Missing TRADE_CHANNEL_ID'); process.exit(1); }
+
+const useWsl = BULLPEN_USE_WSL.toLowerCase() === 'true';
 
 const client = new Client({
   intents: [
@@ -26,13 +29,25 @@ const client = new Client({
 });
 
 // --- Bullpen CLI helper ---
+// On Windows with WSL2, bullpen is installed inside Ubuntu.
+// We call `wsl -e bullpen <args>` instead of `bullpen <args>` directly.
 async function runBullpen(args) {
   const env = { ...process.env };
   if (BULLPEN_HOME) env.BULLPEN_HOME = BULLPEN_HOME;
   if (BULLPEN_ENV) env.BULLPEN_ENV = BULLPEN_ENV;
   env.BULLPEN_NON_INTERACTIVE = '1';
+
+  let bin, binArgs;
+  if (useWsl) {
+    bin = 'wsl';
+    binArgs = ['-e', BULLPEN_BIN, ...args];
+  } else {
+    bin = BULLPEN_BIN;
+    binArgs = args;
+  }
+
   try {
-    const { stdout } = await execFileAsync(BULLPEN_BIN, args, {
+    const { stdout } = await execFileAsync(bin, binArgs, {
       env, timeout: 60000, maxBuffer: 1024 * 1024 * 5,
     });
     return { ok: true, stdout };
@@ -223,6 +238,7 @@ client.on('messageCreate', async (msg) => {
 
 client.once('ready', () => {
   console.log(`Bullpen Discord bot online — listening in channel ${TRADE_CHANNEL_ID}`);
+  if (useWsl) console.log('WSL2 mode: bullpen commands routed through `wsl -e bullpen`');
 });
 
 client.login(DISCORD_BOT_TOKEN);
