@@ -16,7 +16,6 @@ const {
   BULLPEN_USE_WSL = 'false',
   DEFAULT_BUY_AMOUNT = '2',
   CONFIRM_TIMEOUT = '30',
-  DEFAULT_MAX_PRICE = '0.99',
 } = process.env;
 
 if (!DISCORD_BOT_TOKEN) { console.error('Missing DISCORD_BOT_TOKEN'); process.exit(1); }
@@ -25,7 +24,7 @@ if (!TRADE_CHANNEL_ID) { console.error('Missing TRADE_CHANNEL_ID'); process.exit
 const useWsl = BULLPEN_USE_WSL.toLowerCase() === 'true';
 const confirmTimeoutSec = parseInt(CONFIRM_TIMEOUT, 10) || 30;
 
-// --- Round amount to 2 decimal places (Polymarket maker amount max accuracy) ---
+// --- Round amount to 2 decimal places ---
 function roundAmount(amount) {
   return Math.round(parseFloat(amount) * 100) / 100;
 }
@@ -36,104 +35,15 @@ function fmtAmount(amount) {
 }
 
 // --- Round price to 2 decimal places ---
-function roundPrice(price) {
-  return Math.round(parseFloat(price) * 100) / 100;
-}
-
-// --- Format price as string with exactly 2 decimals ---
 function fmtPrice(price) {
-  return roundPrice(price).toFixed(2);
+  return (Math.round(parseFloat(price) * 100) / 100).toFixed(2);
 }
 
-// --- Find a USDC amount (2 decimals) where shares = amount/price has <= 6 decimals ---
-// This prevents the CLOB "invalid amounts" precision rejection
-function findCleanAmount(targetAmount, price) {
-  if (!price || price <= 0 || !isFinite(price)) return null;
-
-  // Check if original amount works
-  let shares = targetAmount / price;
-  let rounded = Math.round(shares * 1e6) / 1e6;
-  if (Math.abs(rounded - shares) < 1e-9) {
-    console.log(`Clean amount found: $${targetAmount.toFixed(2)} → ${shares} shares (exact)`);
-    return targetAmount;
-  }
-
-  // Try nearby amounts (±$2.00 in $0.01 increments)
-  for (let delta = 0.01; delta <= 2.00; delta += 0.01) {
-    for (const sign of [-1, 1]) {
-      const amt = Math.round((targetAmount + sign * delta) * 100) / 100;
-      if (amt <= 0) continue;
-      shares = amt / price;
-      rounded = Math.round(shares * 1e6) / 1e6;
-      if (Math.abs(rounded - shares) < 1e-9) {
-        console.log(`Clean amount found: $${amt.toFixed(2)} → ${rounded} shares (delta=${sign * delta})`);
-        return amt;
-      }
-    }
-  }
-
-  // Try wider range
-  for (let delta = 2.01; delta <= 10.00; delta += 0.01) {
-    for (const sign of [-1, 1]) {
-      const amt = Math.round((targetAmount + sign * delta) * 100) / 100;
-      if (amt <= 0) continue;
-      shares = amt / price;
-      rounded = Math.round(shares * 1e6) / 1e6;
-      if (Math.abs(rounded - shares) < 1e-9) {
-        console.log(`Clean amount found: $${amt.toFixed(2)} → ${rounded} shares (delta=${sign * delta})`);
-        return amt;
-      }
-    }
-  }
-
-  console.log(`No clean amount found for $${targetAmount} at price ${price}`);
-  return null;
-}
-
-// --- Parse price from preview output (handles cents, dollars, Polymarket 0-1 format) ---
-function parsePriceFromOutput(stdout) {
-  const data = parseBullpenResult(stdout);
-  if (data) {
-    // Try various JSON fields
-    let p = data.price || data.avg_price || data.fill_price || data.execution_price || data.best_ask || data.ask || data.best_price;
-    if (p !== undefined && p !== null) {
-      p = parseFloat(p);
-      if (!isNaN(p) && p > 0) {
-        // If price looks like cents (e.g., 0.885 means 0.885 cents = $0.00885)
-        // Polymarket prices are 0-1 where 1 = $1 = 100 cents
-        // If p > 1, it's likely in cents → convert to dollars
-        // If p < 1, it could be Polymarket terms (0-1) or cents
-        // The preview showed "0.885¢" which means 0.885 cents = $0.00885
-        // But the JSON might store it as 0.00885 (Polymarket terms) or 0.885 (cents)
-        // We'll check: if p < 0.01, it's likely already in Polymarket terms
-        // If p >= 0.01 and p < 1, it could be cents (0.885 cents) or Polymarket (0.885 = 88.5 cents)
-        // The ¢ symbol in the text output suggests cents
-        // Let's check the text output for ¢ symbol
-        const text = stdout || '';
-        if (text.includes('¢') && p < 1) {
-          // Price is in cents, convert to dollars
-          return p / 100;
-        }
-        // Otherwise assume Polymarket terms (0-1)
-        return p;
-      }
-    }
-  }
-
-  // Parse from text
-  const text = stdout || '';
-  // Look for "Price: 0.885¢" pattern
-  const centsMatch = text.match(/Price:?\s*([\d.]+)\s*¢/i);
-  if (centsMatch) {
-    return parseFloat(centsMatch[1]) / 100; // cents to dollars
-  }
-  // Look for "Price: $0.88" or "Price: 0.88" pattern
-  const dollarMatch = text.match(/Price:?\s*\$?([\d.]+)/i);
-  if (dollarMatch) {
-    return parseFloat(dollarMatch[1]);
-  }
-
-  return null;
+// --- Round display value to max 4 decimals (for shares, potential, etc) ---
+function fmtDisplay(value, decimals = 4) {
+  const n = parseFloat(value);
+  if (isNaN(n)) return String(value);
+  return parseFloat(n.toFixed(decimals)).toString();
 }
 
 // --- Auto-detect bullpen binary path ---
@@ -247,10 +157,10 @@ async function searchMarket(query) {
 }
 
 // --- Preview buy (no money moves) ---
+// --max-price is OPTIONAL — only pass it if user specified one
 async function previewBuy(slug, outcome, amount, maxPrice) {
   const args = ['polymarket', 'buy', slug, outcome, fmtAmount(amount)];
-  const price = maxPrice ? fmtPrice(maxPrice) : DEFAULT_MAX_PRICE;
-  args.push('--max-price', price);
+  if (maxPrice) args.push('--max-price', fmtPrice(maxPrice));
   args.push('--preview', '--output', 'json');
   return runBullpen(args);
 }
@@ -258,8 +168,7 @@ async function previewBuy(slug, outcome, amount, maxPrice) {
 // --- Execute buy (real trade) ---
 async function executeBuy(slug, outcome, amount, maxPrice) {
   const args = ['polymarket', 'buy', slug, outcome, fmtAmount(amount)];
-  const price = maxPrice ? fmtPrice(maxPrice) : DEFAULT_MAX_PRICE;
-  args.push('--max-price', price);
+  if (maxPrice) args.push('--max-price', fmtPrice(maxPrice));
   args.push('--yes', '--output', 'json');
   return runBullpen(args);
 }
@@ -268,9 +177,7 @@ async function executeBuy(slug, outcome, amount, maxPrice) {
 async function sellShares(slug, outcome, maxShares, preview) {
   const args = ['polymarket', 'sell', slug, outcome];
   if (maxShares === 'max') args.push('--max');
-  else if (maxShares) {
-    args.push(fmtAmount(maxShares));
-  }
+  else if (maxShares) args.push(fmtAmount(maxShares));
   if (preview) args.push('--preview');
   else args.push('--yes');
   args.push('--output', 'json');
@@ -355,13 +262,13 @@ function buildPreviewEmbed(cmd, result) {
   embed.addFields(
     { name: 'Market', value: `\`${String(market).slice(0, 100)}\``, inline: true },
     { name: 'Outcome', value: String(outcome), inline: true },
-    { name: 'Amount', value: amount !== 'N/A' ? `$${amount}` : `$${fmtAmount(cmd.amount)}`, inline: true },
+    { name: 'Amount', value: amount !== 'N/A' ? `$${fmtDisplay(amount, 2)}` : `$${fmtAmount(cmd.amount)}`, inline: true },
   );
 
-  if (info.price) embed.addFields({ name: 'Price', value: `${info.price}¢`, inline: true });
-  if (info.shares) embed.addFields({ name: 'Est. Shares', value: String(info.shares), inline: true });
-  if (info.potential) embed.addFields({ name: 'Potential', value: `$${info.potential}`, inline: true });
-  if (info.spread) embed.addFields({ name: 'Spread', value: `${info.spread}¢`, inline: true });
+  if (info.price) embed.addFields({ name: 'Price', value: `${fmtDisplay(info.price, 4)}¢`, inline: true });
+  if (info.shares) embed.addFields({ name: 'Est. Shares', value: fmtDisplay(info.shares, 4), inline: true });
+  if (info.potential) embed.addFields({ name: 'Potential', value: `$${fmtDisplay(info.potential, 4)}`, inline: true });
+  if (info.spread) embed.addFields({ name: 'Spread', value: `${fmtDisplay(info.spread, 4)}¢`, inline: true });
 
   embed.setFooter({ text: `Type "y" to confirm — or anything else to cancel (${confirmTimeoutSec}s timeout)` });
 
@@ -397,12 +304,12 @@ function buildTradeEmbed(cmd, result) {
   embed.addFields(
     { name: 'Market', value: `\`${String(market).slice(0, 100)}\``, inline: true },
     { name: 'Outcome', value: String(outcome), inline: true },
-    { name: 'Spent', value: amount !== 'N/A' ? `$${amount}` : `$${fmtAmount(cmd.amount)}`, inline: true },
+    { name: 'Spent', value: amount !== 'N/A' ? `$${fmtDisplay(amount, 2)}` : `$${fmtAmount(cmd.amount)}`, inline: true },
   );
 
-  if (info.shares) embed.addFields({ name: 'Shares', value: String(info.shares), inline: true });
-  if (info.price) embed.addFields({ name: 'Fill Price', value: `${info.price}¢`, inline: true });
-  if (info.potential) embed.addFields({ name: 'Potential', value: `$${info.potential}`, inline: true });
+  if (info.shares) embed.addFields({ name: 'Shares', value: fmtDisplay(info.shares, 4), inline: true });
+  if (info.price) embed.addFields({ name: 'Fill Price', value: `${fmtDisplay(info.price, 4)}¢`, inline: true });
+  if (info.potential) embed.addFields({ name: 'Potential', value: `$${fmtDisplay(info.potential, 4)}`, inline: true });
   if (info.orderId) embed.addFields({ name: 'Order ID', value: `\`${String(info.orderId).slice(0, 50)}\``, inline: true });
 
   return embed;
@@ -438,9 +345,9 @@ function buildSellEmbed(cmd, result, isPreview) {
     { name: 'Status', value: isPreview ? 'Preview' : 'Filled', inline: true },
   );
 
-  if (info.shares) embed.addFields({ name: 'Shares', value: String(info.shares), inline: true });
-  if (info.price) embed.addFields({ name: 'Price', value: `${info.price}¢`, inline: true });
-  if (info.amount) embed.addFields({ name: 'Received', value: `$${info.amount}`, inline: true });
+  if (info.shares) embed.addFields({ name: 'Shares', value: fmtDisplay(info.shares, 4), inline: true });
+  if (info.price) embed.addFields({ name: 'Price', value: `${fmtDisplay(info.price, 4)}¢`, inline: true });
+  if (info.amount) embed.addFields({ name: 'Received', value: `$${fmtDisplay(info.amount, 2)}`, inline: true });
 
   return embed;
 }
@@ -471,7 +378,7 @@ function formatStatusSummary(result) {
   }
   if (data?.balance !== undefined || data?.usdc_balance !== undefined) {
     const bal = data?.balance ?? data?.usdc_balance ?? 'N/A';
-    fields.push({ name: 'USDC Balance', value: `$${bal}`, inline: true });
+    fields.push({ name: 'USDC Balance', value: `$${fmtDisplay(bal, 2)}`, inline: true });
   }
   if (data?.network || data?.chain) {
     fields.push({ name: 'Network', value: String(data.network || data.chain), inline: true });
@@ -518,9 +425,9 @@ function formatPositionsSummary(result) {
     const value = p?.value || p?.current_value || p?.cost || 'N/A';
     const pnl = p?.pnl || p?.profit || p?.realized_pnl || null;
 
-    let line = `**${market}**\n${outcome} | ${shares} shares`;
-    if (value !== 'N/A') line += ` | $${value}`;
-    if (pnl !== null) line += ` | PnL: $${pnl}`;
+    let line = `**${market}**\n${outcome} | ${fmtDisplay(shares, 4)} shares`;
+    if (value !== 'N/A') line += ` | $${fmtDisplay(value, 2)}`;
+    if (pnl !== null) line += ` | PnL: $${fmtDisplay(pnl, 2)}`;
 
     fields.push({ name: `#${i + 1}`, value: line.slice(0, 200), inline: false });
   });
@@ -599,7 +506,7 @@ function isPrecisionError(result) {
   return text.includes('invalid amounts') || text.includes('max accuracy') || text.includes('2 decimals') || text.includes('6 decimals');
 }
 
-// --- Interactive buy: preview, wait for "y", then execute with precision fix ---
+// --- Interactive buy: preview, wait for "y", then execute ---
 async function doBuyWithConfirm(msg, slug, outcome, amount, maxPrice, marketLabel) {
   await msg.channel.sendTyping();
   const previewResult = await previewBuy(slug, outcome, amount, maxPrice);
@@ -610,10 +517,6 @@ async function doBuyWithConfirm(msg, slug, outcome, amount, maxPrice, marketLabe
   if (!previewResult.ok) {
     return;
   }
-
-  // Extract price from preview for precision fix
-  const previewPrice = parsePriceFromOutput(previewResult.stdout);
-  console.log(`Preview price parsed: ${previewPrice} (for amount $${amount})`);
 
   await msg.channel.send(`Type **y** to confirm this trade, or anything else to cancel (${confirmTimeoutSec}s timeout)...`);
 
@@ -634,25 +537,15 @@ async function doBuyWithConfirm(msg, slug, outcome, amount, maxPrice, marketLabe
     if (response.content.trim().toLowerCase() === 'y' || response.content.trim().toLowerCase() === 'yes') {
       await msg.channel.send('⏳ Executing trade...');
 
-      // First attempt with original amount
+      // Execute with original amount — no amount reduction
       let execResult = await executeBuy(slug, outcome, amount, maxPrice);
 
-      // If precision error, find a clean amount and retry
-      if (!execResult.ok && isPrecisionError(execResult) && previewPrice) {
-        console.log(`Precision error detected. Finding clean amount for price ${previewPrice}...`);
-        const cleanAmount = findCleanAmount(roundAmount(amount), previewPrice);
-
-        if (cleanAmount && cleanAmount !== roundAmount(amount)) {
-          await msg.channel.send(`⚠️ Adjusting amount to $${fmtAmount(cleanAmount)} for clean order precision...`);
-          execResult = await executeBuy(slug, outcome, cleanAmount, maxPrice);
-        } else if (!cleanAmount) {
-          // If no clean amount found, try rounding shares manually by using integer amount
-          const intAmount = Math.ceil(amount);
-          if (intAmount !== Math.round(amount)) {
-            await msg.channel.send(`⚠️ Trying $${intAmount.toFixed(2)} instead...`);
-            execResult = await executeBuy(slug, outcome, intAmount, maxPrice);
-          }
-        }
+      // If precision error AND we passed --max-price, retry WITHOUT it
+      // The --max-price flag can cause the CLOB to compute ugly share counts
+      if (!execResult.ok && isPrecisionError(execResult) && maxPrice) {
+        console.log('Precision error with --max-price, retrying without it...');
+        await msg.channel.send('⚠️ Retrying without price limit...');
+        execResult = await executeBuy(slug, outcome, amount, null);
       }
 
       const execEmbed = buildTradeEmbed({ slug, market: marketLabel, outcome, amount }, execResult);
@@ -713,7 +606,6 @@ client.on('messageCreate', async (msg) => {
           '`!help` — Show this help',
           '',
           `Default buy amount: $${DEFAULT_BUY_AMOUNT} (set DEFAULT_BUY_AMOUNT in .env)`,
-          `Default max price: ${DEFAULT_MAX_PRICE} (set DEFAULT_MAX_PRICE in .env)`,
           `Confirmation timeout: ${confirmTimeoutSec}s (set CONFIRM_TIMEOUT in .env)`,
         ].join('\n'))] });
         break;
@@ -728,7 +620,6 @@ client.on('messageCreate', async (msg) => {
           { name: 'BULLPEN_USE_WSL', value: String(useWsl), inline: true },
           { name: 'BULLPEN_HOME', value: BULLPEN_HOME || '(not set)', inline: true },
           { name: 'DEFAULT_BUY_AMOUNT', value: DEFAULT_BUY_AMOUNT, inline: true },
-          { name: 'DEFAULT_MAX_PRICE', value: DEFAULT_MAX_PRICE, inline: true },
           { name: 'CONFIRM_TIMEOUT', value: String(confirmTimeoutSec) + 's', inline: true },
         );
         const verResult = await runBullpen(['--version']);
@@ -911,7 +802,6 @@ client.once('ready', async () => {
   resolvedBin = await resolveBullpenPath();
   console.log(`Using bullpen binary: ${resolvedBin}`);
   console.log(`Default buy amount: $${DEFAULT_BUY_AMOUNT}`);
-  console.log(`Default max price: ${DEFAULT_MAX_PRICE}`);
   console.log(`Confirmation timeout: ${confirmTimeoutSec}s`);
 });
 
