@@ -24,14 +24,12 @@ const useWsl = BULLPEN_USE_WSL.toLowerCase() === 'true';
 // --- Auto-detect bullpen binary path ---
 let resolvedBin = BULLPEN_BIN;
 async function resolveBullpenPath() {
-  // Try the configured bin first
   try {
     await execFileAsync(BULLPEN_BIN, ['--version'], { timeout: 5000 });
     console.log(`Bullpen found: ${BULLPEN_BIN}`);
     return BULLPEN_BIN;
   } catch {}
 
-  // Try common install locations
   const commonPaths = [
     '/usr/local/bin/bullpen',
     '/usr/bin/bullpen',
@@ -48,7 +46,6 @@ async function resolveBullpenPath() {
     } catch {}
   }
 
-  // Try `which bullpen` via shell
   try {
     const { stdout } = await execAsync('which bullpen 2>/dev/null || command -v bullpen 2>/dev/null', { timeout: 5000 });
     const path = stdout.trim();
@@ -71,6 +68,17 @@ const client = new Client({
   ],
 });
 
+// --- Extract slug from Polymarket URL ---
+function extractSlugFromUrl(url) {
+  // https://polymarket.com/event/atp-rinderk-tabur-2026-07-15-first-set-winner-rinderknech-vs-tabur
+  // https://polymarket.com/market/some-market-slug
+  let m = url.match(/polymarket\.com\/event\/([^\s?]+)/i);
+  if (m) return { slug: m[1], type: 'event' };
+  m = url.match(/polymarket\.com\/market\/([^\s?]+)/i);
+  if (m) return { slug: m[1], type: 'market' };
+  return null;
+}
+
 // --- Bullpen CLI helper ---
 async function runBullpen(args) {
   const env = { ...process.env };
@@ -78,7 +86,6 @@ async function runBullpen(args) {
   if (BULLPEN_ENV) env.BULLPEN_ENV = BULLPEN_ENV;
   env.BULLPEN_NON_INTERACTIVE = '1';
 
-  // Make sure common bin dirs are in PATH
   const extraPaths = [
     '/usr/local/bin',
     '/usr/bin',
@@ -102,7 +109,6 @@ async function runBullpen(args) {
     });
     return { ok: true, stdout };
   } catch (err) {
-    // err.message is usually "Command failed: ..." — get the real error
     const realError = err.stderr || err.stdout || err.message;
     return { ok: false, stdout: err.stdout || '', stderr: realError };
   }
@@ -124,6 +130,20 @@ async function searchMarket(query) {
   }
 }
 
+// --- Get event details (find market slug from event slug) ---
+async function getEventMarkets(eventSlug) {
+  const { ok, stdout, stderr } = await runBullpen([
+    'polymarket', 'event', eventSlug, '--output', 'json',
+  ]);
+  if (!ok) return { ok: false, error: stderr || stdout };
+  try {
+    const data = JSON.parse(stdout);
+    return { ok: true, data };
+  } catch {
+    return { ok: false, error: 'Failed to parse event data' };
+  }
+}
+
 // --- Buy shares ---
 async function buyShares(slug, outcome, amount) {
   return runBullpen(['trade', 'buy', slug, outcome, String(amount), '--yes', '--output', 'json']);
@@ -134,21 +154,35 @@ function parseCommand(content) {
   const t = content.trim();
   if (!t.startsWith('!')) return null;
 
-  let m = t.match(/^!buy\s+"([^"]+)"\s+(\w+)\s+([\d.]+)$/i);
+  // !buy-url <url> <outcome> <amount>
+  let m = t.match(/^!buy-url\s+(https?:\/\/\S+)\s+(\w+)\s+([\d.]+)$/i);
+  if (m) return { type: 'buy-url', url: m[1], outcome: m[2].toUpperCase(), amount: parseFloat(m[3]) };
+
+  // !buy "Rinderknech" https://polymarket.com/event/... 10
+  m = t.match(/^!buy\s+"([^"]+)"\s+(https?:\/\/\S+)\s+([\d.]+)$/i);
+  if (m) return { type: 'buy-url', outcome: m[1].toUpperCase(), url: m[2], amount: parseFloat(m[3]) };
+
+  // !buy "Market Name" YES 10
+  m = t.match(/^!buy\s+"([^"]+)"\s+(\w+)\s+([\d.]+)$/i);
   if (m) return { type: 'buy', market: m[1], outcome: m[2].toUpperCase(), amount: parseFloat(m[3]) };
 
+  // !buy Market Name YES 10 (no quotes)
   m = t.match(/^!buy\s+(.+?)\s+(\w+)\s+([\d.]+)$/i);
   if (m) return { type: 'buy', market: m[1].trim(), outcome: m[2].toUpperCase(), amount: parseFloat(m[3]) };
 
+  // !buy-slug market-slug YES 10
   m = t.match(/^!buy-slug\s+(\S+)\s+(\w+)\s+([\d.]+)$/i);
   if (m) return { type: 'buy-slug', slug: m[1], outcome: m[2].toUpperCase(), amount: parseFloat(m[3]) };
 
+  // !trade buy $10 of YES on "Market Name"
   m = t.match(/^!trade\s+buy\s+\$([\d.]+)\s+of\s+(\w+)\s+on\s+"([^"]+)"$/i);
   if (m) return { type: 'buy', market: m[3], outcome: m[2].toUpperCase(), amount: parseFloat(m[1]) };
 
+  // !trade buy $10 of YES on Market Name
   m = t.match(/^!trade\s+buy\s+\$([\d.]+)\s+of\s+(\w+)\s+on\s+(.+)$/i);
   if (m) return { type: 'buy', market: m[3].trim(), outcome: m[2].toUpperCase(), amount: parseFloat(m[1]) };
 
+  // !search bitcoin
   m = t.match(/^!search\s+(.+)$/i);
   if (m) return { type: 'search', query: m[1] };
 
@@ -199,6 +233,8 @@ client.on('messageCreate', async (msg) => {
       case 'help': {
         await msg.reply({ embeds: [new EmbedBuilder().setColor(0x3498db).setTitle('Bullpen Discord Bot Commands').setDescription([
           '`!buy "Market Name" YES 10` — Buy $10 of YES on the named market',
+          '`!buy "Rinderknech" https://polymarket.com/event/... 10` — Buy $10 of an outcome by Polymarket URL',
+          '`!buy-url https://polymarket.com/event/... YES 10` — Buy by URL (outcome first)',
           '`!buy-slug market-slug YES 10` — Buy by exact slug',
           '`!trade buy $10 of YES on "Market Name"` — Natural language buy',
           '`!search Trump election` — Search Polymarket markets',
@@ -220,7 +256,6 @@ client.on('messageCreate', async (msg) => {
           { name: 'BULLPEN_HOME', value: BULLPEN_HOME || '(not set)', inline: true },
           { name: 'PATH', value: '```' + (process.env.PATH || '').slice(0, 500) + '```' },
         );
-        // Try running bullpen --version
         const verResult = await runBullpen(['--version']);
         if (verResult.ok) {
           embed.addFields({ name: 'bullpen --version', value: '```' + verResult.stdout.slice(0, 200) + '```' });
@@ -276,6 +311,49 @@ client.on('messageCreate', async (msg) => {
         break;
       }
 
+      case 'buy-url': {
+        await msg.channel.sendTyping();
+        const extracted = extractSlugFromUrl(cmd.url);
+        if (!extracted) {
+          await msg.reply({ embeds: [new EmbedBuilder().setColor(0xff0000).setTimestamp().setTitle('Invalid URL').setDescription('Could not extract slug from Polymarket URL')] });
+          break;
+        }
+
+        await msg.reply(`Found ${extracted.type} slug: \`${extracted.slug}\`. Buying **${cmd.outcome}** for $${cmd.amount}...`);
+
+        // For event URLs, try to find the specific market matching the outcome
+        if (extracted.type === 'event') {
+          // Try using the event slug directly with bullpen trade buy
+          const buyResult = await buyShares(extracted.slug, cmd.outcome, cmd.amount);
+          if (buyResult.ok) {
+            await msg.channel.send({ embeds: [buildTradeEmbed({ ...cmd, slug: extracted.slug }, buyResult)] });
+          } else {
+            // If direct event slug fails, try searching for the market
+            await msg.channel.send('Direct event slug failed, searching for specific market...');
+            const searchResult = await searchMarket(extracted.slug);
+            if (searchResult.ok && searchResult.markets.length > 0) {
+              // Find market matching the outcome
+              const matching = searchResult.markets.find(m => {
+                const title = (m.title || m.question || m.name || '').toLowerCase();
+                return title.includes(cmd.outcome.toLowerCase());
+              }) || searchResult.markets[0];
+              const slug = matching.slug || matching.market_slug || matching.id;
+              const title = matching.title || matching.question || matching.name || slug;
+              await msg.channel.send(`Found market: **${title}** (slug: \`${slug}\`). Executing buy ${cmd.outcome} for $${cmd.amount}...`);
+              const retryResult = await buyShares(slug, cmd.outcome, cmd.amount);
+              await msg.channel.send({ embeds: [buildTradeEmbed({ ...cmd, slug }, retryResult)] });
+            } else {
+              await msg.channel.send({ embeds: [new EmbedBuilder().setColor(0xff0000).setTimestamp().setTitle('Market Not Found').setDescription(`Could not find a market for event \`${extracted.slug}\`. Try \`!buy-slug ${extracted.slug} ${cmd.outcome} ${cmd.amount}\` manually.`)] });
+            }
+          }
+        } else {
+          // Market URL — use slug directly
+          const buyResult = await buyShares(extracted.slug, cmd.outcome, cmd.amount);
+          await msg.channel.send({ embeds: [buildTradeEmbed({ ...cmd, slug: extracted.slug }, buyResult)] });
+        }
+        break;
+      }
+
       case 'buy-slug': {
         await msg.channel.sendTyping();
         await msg.reply(`Executing: buy ${cmd.outcome} on \`${cmd.slug}\` for $${cmd.amount}...`);
@@ -314,7 +392,6 @@ client.on('messageCreate', async (msg) => {
 client.once('ready', async () => {
   console.log(`Bullpen Discord bot online — listening in channel ${TRADE_CHANNEL_ID}`);
   if (useWsl) console.log('WSL2 mode: bullpen commands routed through `wsl -e bullpen`');
-  // Resolve bullpen path on startup
   resolvedBin = await resolveBullpenPath();
   console.log(`Using bullpen binary: ${resolvedBin}`);
 });
