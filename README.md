@@ -20,11 +20,43 @@ A Discord bot that reads trade commands from chat and executes them on Polymarke
 
 ### 1. Install Bullpen CLI
 
+#### Linux / macOS
+
 ```bash
-curl -fsSL https://raw.githubusercontent.com/BullpenFi/bullpen-cli-releases/main/install.sh | bash
+curl -fsSL https://cli.bullpen.fi/install.sh | sh
 bullpen login
 bullpen status
 ```
+
+#### Windows (WSL2)
+
+Bullpen runs on Windows through Ubuntu on WSL2. Open PowerShell as admin:
+
+```powershell
+wsl --install -d Ubuntu
+```
+
+Then open Ubuntu from the Start menu and run every Bullpen command inside the Ubuntu shell (not PowerShell):
+
+```bash
+sudo apt update
+sudo apt install -y curl ca-certificates
+curl -fsSL https://cli.bullpen.fi/install.sh | sh
+bullpen login
+bullpen status
+```
+
+If `bullpen login` doesn't auto-open a browser, run:
+```bash
+bullpen login --no-browser
+```
+Then paste the displayed URL into your Windows browser.
+
+If logins fail with auth or time errors, WSL clock skew is the usual cause:
+```bash
+sudo hwclock -s
+```
+Or from PowerShell: `wsl --shutdown` to restart WSL and resync the clock.
 
 ### 2. Create a Discord bot
 
@@ -46,7 +78,23 @@ cp .env.example .env
 Edit `.env` with your values:
 - `DISCORD_BOT_TOKEN` — your Discord bot token
 - `TRADE_CHANNEL_ID` — the channel ID where the bot listens
-- `BULLPEN_HOME` — path to your Bullpen config directory (usually `~/.bullpen`)
+- `BULLPEN_HOME` — path to your Bullpen config directory
+  - Linux/Mac: `/home/youruser/.bullpen` or `/root/.bullpen`
+  - Windows WSL2: `/home/youruser/.bullpen` (inside Ubuntu)
+- `BULLPEN_USE_WSL` — set to `true` if running the bot on Windows with Bullpen inside WSL2
+
+#### Windows WSL2 .env example
+
+```
+DISCORD_BOT_TOKEN=your_bot_token_here
+TRADE_CHANNEL_ID=your_channel_id_here
+BULLPEN_BIN=bullpen
+BULLPEN_HOME=/home/youruser/.bullpen
+BULLPEN_ENV=production
+BULLPEN_USE_WSL=true
+```
+
+When `BULLPEN_USE_WSL=true`, the bot calls `wsl -e bullpen <args>` instead of `bullpen <args>` directly, so it can reach the Bullpen CLI installed inside your Ubuntu WSL2 environment.
 
 ### 4. Install and run
 
