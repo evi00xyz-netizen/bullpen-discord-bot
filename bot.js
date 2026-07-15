@@ -16,6 +16,7 @@ const {
   BULLPEN_USE_WSL = 'false',
   DEFAULT_BUY_AMOUNT = '2',
   CONFIRM_TIMEOUT = '30',
+  DEFAULT_MAX_PRICE = '0.99',
 } = process.env;
 
 if (!DISCORD_BOT_TOKEN) { console.error('Missing DISCORD_BOT_TOKEN'); process.exit(1); }
@@ -32,6 +33,16 @@ function roundAmount(amount) {
 // --- Format amount as string with exactly 2 decimals ---
 function fmtAmount(amount) {
   return roundAmount(amount).toFixed(2);
+}
+
+// --- Round price to 2 decimal places (prevents taker amount precision overflow) ---
+function roundPrice(price) {
+  return Math.round(parseFloat(price) * 100) / 100;
+}
+
+// --- Format price as string with exactly 2 decimals ---
+function fmtPrice(price) {
+  return roundPrice(price).toFixed(2);
 }
 
 // --- Auto-detect bullpen binary path ---
@@ -144,10 +155,30 @@ async function searchMarket(query) {
   }
 }
 
+// --- Get current market price ---
+async function getMarketPrice(slug, outcome) {
+  const { ok, stdout } = await runBullpen([
+    'polymarket', 'price', slug, outcome, '--output', 'json',
+  ]);
+  if (!ok) return null;
+  const data = parseBullpenResult(stdout);
+  if (data) {
+    const price = data.price || data.best_ask || data.ask || data.best_price || null;
+    if (price !== null) return parseFloat(price);
+  }
+  // try parsing from text
+  const m = stdout.match(/price:?\s*\$?([\d.]+)/i);
+  if (m) return parseFloat(m[1]);
+  return null;
+}
+
 // --- Preview buy (no money moves) ---
+// Always pass --max-price rounded to 2 decimals to prevent CLOB precision errors
 async function previewBuy(slug, outcome, amount, maxPrice) {
   const args = ['polymarket', 'buy', slug, outcome, fmtAmount(amount)];
-  if (maxPrice) args.push('--max-price', String(maxPrice));
+  // Always include max-price — use provided (rounded) or default
+  const price = maxPrice ? fmtPrice(maxPrice) : DEFAULT_MAX_PRICE;
+  args.push('--max-price', price);
   args.push('--preview', '--output', 'json');
   return runBullpen(args);
 }
@@ -155,7 +186,9 @@ async function previewBuy(slug, outcome, amount, maxPrice) {
 // --- Execute buy (real trade) ---
 async function executeBuy(slug, outcome, amount, maxPrice) {
   const args = ['polymarket', 'buy', slug, outcome, fmtAmount(amount)];
-  if (maxPrice) args.push('--max-price', String(maxPrice));
+  // Always include max-price — use provided (rounded) or default
+  const price = maxPrice ? fmtPrice(maxPrice) : DEFAULT_MAX_PRICE;
+  args.push('--max-price', price);
   args.push('--yes', '--output', 'json');
   return runBullpen(args);
 }
@@ -578,6 +611,7 @@ client.on('messageCreate', async (msg) => {
           '`!help` — Show this help',
           '',
           `Default buy amount: $${DEFAULT_BUY_AMOUNT} (set DEFAULT_BUY_AMOUNT in .env)`,
+          `Default max price: ${DEFAULT_MAX_PRICE} (set DEFAULT_MAX_PRICE in .env)`,
           `Confirmation timeout: ${confirmTimeoutSec}s (set CONFIRM_TIMEOUT in .env)`,
         ].join('\n'))] });
         break;
@@ -592,6 +626,7 @@ client.on('messageCreate', async (msg) => {
           { name: 'BULLPEN_USE_WSL', value: String(useWsl), inline: true },
           { name: 'BULLPEN_HOME', value: BULLPEN_HOME || '(not set)', inline: true },
           { name: 'DEFAULT_BUY_AMOUNT', value: DEFAULT_BUY_AMOUNT, inline: true },
+          { name: 'DEFAULT_MAX_PRICE', value: DEFAULT_MAX_PRICE, inline: true },
           { name: 'CONFIRM_TIMEOUT', value: String(confirmTimeoutSec) + 's', inline: true },
         );
         const verResult = await runBullpen(['--version']);
@@ -647,7 +682,7 @@ client.on('messageCreate', async (msg) => {
           break;
         }
 
-        await msg.reply(`Found ${extracted.type} slug: \`${extracted.slug}\`. Previewing buy **${cmd.outcome}** for $${fmtAmount(cmd.amount)}${cmd.maxPrice ? ` (max price $${cmd.maxPrice})` : ''}...`);
+        await msg.reply(`Found ${extracted.type} slug: \`${extracted.slug}\`. Previewing buy **${cmd.outcome}** for $${fmtAmount(cmd.amount)}${cmd.maxPrice ? ` (max price $${fmtPrice(cmd.maxPrice)})` : ''}...`);
 
         const previewResult = await previewBuy(extracted.slug, cmd.outcome, cmd.amount, cmd.maxPrice);
 
@@ -700,7 +735,7 @@ client.on('messageCreate', async (msg) => {
 
       case 'preview-slug': {
         await msg.channel.sendTyping();
-        await msg.reply(`Previewing: buy ${cmd.outcome} on \`${cmd.slug}\` for $${fmtAmount(cmd.amount)}${cmd.maxPrice ? ` (max price $${cmd.maxPrice})` : ''}...`);
+        await msg.reply(`Previewing: buy ${cmd.outcome} on \`${cmd.slug}\` for $${fmtAmount(cmd.amount)}${cmd.maxPrice ? ` (max price $${fmtPrice(cmd.maxPrice)})` : ''}...`);
         const result = await previewBuy(cmd.slug, cmd.outcome, cmd.amount, cmd.maxPrice);
         const embed = buildPreviewEmbed({ ...cmd, market: cmd.slug }, result);
         await msg.channel.send({ embeds: [embed] });
@@ -774,6 +809,7 @@ client.once('ready', async () => {
   resolvedBin = await resolveBullpenPath();
   console.log(`Using bullpen binary: ${resolvedBin}`);
   console.log(`Default buy amount: $${DEFAULT_BUY_AMOUNT}`);
+  console.log(`Default max price: ${DEFAULT_MAX_PRICE}`);
   console.log(`Confirmation timeout: ${confirmTimeoutSec}s`);
 });
 
