@@ -24,6 +24,11 @@ if (!TRADE_CHANNEL_ID) { console.error('Missing TRADE_CHANNEL_ID'); process.exit
 const useWsl = BULLPEN_USE_WSL.toLowerCase() === 'true';
 const confirmTimeoutSec = parseInt(CONFIRM_TIMEOUT, 10) || 30;
 
+// --- Round amount to 2 decimal places (Polymarket maker amount max accuracy) ---
+function roundAmount(amount) {
+  return Math.round(parseFloat(amount) * 100) / 100;
+}
+
 // --- Auto-detect bullpen binary path ---
 let resolvedBin = BULLPEN_BIN;
 async function resolveBullpenPath() {
@@ -136,7 +141,8 @@ async function searchMarket(query) {
 
 // --- Preview buy (no money moves) ---
 async function previewBuy(slug, outcome, amount, maxPrice) {
-  const args = ['trade', 'buy', slug, outcome, String(amount)];
+  const rounded = roundAmount(amount);
+  const args = ['trade', 'buy', slug, outcome, rounded.toFixed(2)];
   if (maxPrice) args.push('--max-price', String(maxPrice));
   args.push('--preview', '--output', 'json');
   return runBullpen(args);
@@ -144,7 +150,8 @@ async function previewBuy(slug, outcome, amount, maxPrice) {
 
 // --- Execute buy (real trade) ---
 async function executeBuy(slug, outcome, amount, maxPrice) {
-  const args = ['trade', 'buy', slug, outcome, String(amount)];
+  const rounded = roundAmount(amount);
+  const args = ['trade', 'buy', slug, outcome, rounded.toFixed(2)];
   if (maxPrice) args.push('--max-price', String(maxPrice));
   args.push('--yes', '--output', 'json');
   return runBullpen(args);
@@ -154,7 +161,10 @@ async function executeBuy(slug, outcome, amount, maxPrice) {
 async function sellShares(slug, outcome, maxShares, preview) {
   const args = ['trade', 'sell', slug, outcome];
   if (maxShares === 'max') args.push('--max');
-  else if (maxShares) args.push(String(maxShares));
+  else if (maxShares) {
+    const rounded = roundAmount(maxShares);
+    args.push(rounded.toFixed(2));
+  }
   if (preview) args.push('--preview');
   else args.push('--yes');
   args.push('--output', 'json');
@@ -239,7 +249,7 @@ function buildPreviewEmbed(cmd, result) {
   embed.addFields(
     { name: 'Market', value: `\`${String(market).slice(0, 100)}\``, inline: true },
     { name: 'Outcome', value: String(outcome), inline: true },
-    { name: 'Amount', value: amount !== 'N/A' ? `$${amount}` : `$${cmd.amount}`, inline: true },
+    { name: 'Amount', value: amount !== 'N/A' ? `$${amount}` : `$${roundAmount(cmd.amount).toFixed(2)}`, inline: true },
   );
 
   if (info.price) embed.addFields({ name: 'Price', value: `${info.price}¢`, inline: true });
@@ -281,7 +291,7 @@ function buildTradeEmbed(cmd, result) {
   embed.addFields(
     { name: 'Market', value: `\`${String(market).slice(0, 100)}\``, inline: true },
     { name: 'Outcome', value: String(outcome), inline: true },
-    { name: 'Spent', value: amount !== 'N/A' ? `$${amount}` : `$${cmd.amount}`, inline: true },
+    { name: 'Spent', value: amount !== 'N/A' ? `$${amount}` : `$${roundAmount(cmd.amount).toFixed(2)}`, inline: true },
   );
 
   if (info.shares) embed.addFields({ name: 'Shares', value: String(info.shares), inline: true });
@@ -667,7 +677,7 @@ client.on('messageCreate', async (msg) => {
           break;
         }
 
-        await msg.reply(`Found ${extracted.type} slug: \`${extracted.slug}\`. Previewing buy **${cmd.outcome}** for $${cmd.amount}${cmd.maxPrice ? ` (max price $${cmd.maxPrice})` : ''}...`);
+        await msg.reply(`Found ${extracted.type} slug: \`${extracted.slug}\`. Previewing buy **${cmd.outcome}** for $${roundAmount(cmd.amount).toFixed(2)}${cmd.maxPrice ? ` (max price $${cmd.maxPrice})` : ''}...`);
 
         // Try direct slug first
         const previewResult = await previewBuy(extracted.slug, cmd.outcome, cmd.amount, cmd.maxPrice);
@@ -724,7 +734,7 @@ client.on('messageCreate', async (msg) => {
 
       case 'preview-slug': {
         await msg.channel.sendTyping();
-        await msg.reply(`Previewing: buy ${cmd.outcome} on \`${cmd.slug}\` for $${cmd.amount}${cmd.maxPrice ? ` (max price $${cmd.maxPrice})` : ''}...`);
+        await msg.reply(`Previewing: buy ${cmd.outcome} on \`${cmd.slug}\` for $${roundAmount(cmd.amount).toFixed(2)}${cmd.maxPrice ? ` (max price $${cmd.maxPrice})` : ''}...`);
         const result = await previewBuy(cmd.slug, cmd.outcome, cmd.amount, cmd.maxPrice);
         const embed = buildPreviewEmbed({ ...cmd, market: cmd.slug }, result);
         await msg.channel.send({ embeds: [embed] });
@@ -746,7 +756,7 @@ client.on('messageCreate', async (msg) => {
           break;
         }
         const title = first.title || first.question || first.name || slug;
-        await msg.channel.send(`Found: **${title}** (slug: \`${slug}\`). Previewing buy ${cmd.outcome} for $${cmd.amount}...`);
+        await msg.channel.send(`Found: **${title}** (slug: \`${slug}\`). Previewing buy ${cmd.outcome} for $${roundAmount(cmd.amount).toFixed(2)}...`);
         const result = await previewBuy(slug, cmd.outcome, cmd.amount, cmd.maxPrice);
         const embed = buildPreviewEmbed({ ...cmd, slug, market: title }, result);
         await msg.channel.send({ embeds: [embed] });
