@@ -130,7 +130,6 @@ async function searchMarket(query) {
 }
 
 // --- Buy shares ---
-// bullpen trade buy <MARKET_SLUG> <outcome> <amount> --yes --output json
 async function buyShares(slug, outcome, amount, maxPrice) {
   const args = ['trade', 'buy', slug, outcome, String(amount)];
   if (maxPrice) args.push('--max-price', String(maxPrice));
@@ -158,33 +157,34 @@ async function sellShares(slug, outcome, maxShares, preview) {
 }
 
 // --- Parse commands ---
+// IMPORTANT: natural language patterns work WITHOUT the ! prefix
+// ! commands are checked first, then natural language patterns
 function parseCommand(content) {
   const t = content.trim();
-  if (!t.startsWith('!')) return null;
 
   // ==========================================
-  // NATURAL LANGUAGE: Buy "Rinderknech" on Polymarket: https://polymarket.com/event/...
+  // NATURAL LANGUAGE (no ! prefix needed)
+  // These are checked FIRST so plain text works
   // ==========================================
-  let m = t.match(/^!?\s*Buy\s+"([^"]+)"\s+on\s+Polymarket:?\s+(https?:\/\/\S+)/i);
-  if (m) {
-    return { type: 'buy-url', outcome: m[1], url: m[2], amount: parseFloat(DEFAULT_BUY_AMOUNT), maxPrice: null, natural: true };
-  }
 
   // Buy "Rinderknech" on Polymarket: https://polymarket.com/event/... for $10
-  m = t.match(/^!?\s*Buy\s+"([^"]+)"\s+on\s+Polymarket:?\s+(https?:\/\/\S+)\s+for\s+\$([\d.]+)/i);
-  if (m) {
-    return { type: 'buy-url', outcome: m[1], url: m[2], amount: parseFloat(m[3]), maxPrice: null, natural: true };
-  }
+  let m = t.match(/^Buy\s+"([^"]+)"\s+on\s+Polymarket:?\s+(https?:\/\/\S+)\s+for\s+\$([\d.]+)/i);
+  if (m) return { type: 'buy-url', outcome: m[1], url: m[2], amount: parseFloat(m[3]), maxPrice: null, natural: true };
 
   // Buy $10 of "Rinderknech" on Polymarket: https://polymarket.com/event/...
-  m = t.match(/^!?\s*Buy\s+\$([\d.]+)\s+of\s+"([^"]+)"\s+on\s+Polymarket:?\s+(https?:\/\/\S+)/i);
-  if (m) {
-    return { type: 'buy-url', outcome: m[2], url: m[3], amount: parseFloat(m[1]), maxPrice: null, natural: true };
-  }
+  m = t.match(/^Buy\s+\$([\d.]+)\s+of\s+"([^"]+)"\s+on\s+Polymarket:?\s+(https?:\/\/\S+)/i);
+  if (m) return { type: 'buy-url', outcome: m[2], url: m[3], amount: parseFloat(m[1]), maxPrice: null, natural: true };
+
+  // Buy "Rinderknech" on Polymarket: https://polymarket.com/event/...
+  m = t.match(/^Buy\s+"([^"]+)"\s+on\s+Polymarket:?\s+(https?:\/\/\S+)/i);
+  if (m) return { type: 'buy-url', outcome: m[1], url: m[2], amount: parseFloat(DEFAULT_BUY_AMOUNT), maxPrice: null, natural: true };
 
   // ==========================================
-  // !buy-url <url> <outcome> <amount> [--max-price 0.20]
+  // ! COMMANDS (require ! prefix)
   // ==========================================
+  if (!t.startsWith('!')) return null;
+
+  // !buy-url <url> <outcome> <amount> [--max-price 0.20]
   m = t.match(/^!buy-url\s+(https?:\/\/\S+)\s+(\w+)\s+([\d.]+)(?:\s+--max-price\s+([\d.]+))?$/i);
   if (m) return { type: 'buy-url', url: m[1], outcome: m[2].toUpperCase(), amount: parseFloat(m[3]), maxPrice: m[4] ? parseFloat(m[4]) : null };
 
@@ -274,11 +274,14 @@ client.on('messageCreate', async (msg) => {
   const cmd = parseCommand(msg.content);
   if (!cmd) return;
 
+  // Log what was parsed for debugging
+  console.log(`Parsed command: ${JSON.stringify(cmd)}`);
+
   try {
     switch (cmd.type) {
       case 'help': {
         await msg.reply({ embeds: [new EmbedBuilder().setColor(0x3498db).setTitle('Bullpen Discord Bot Commands').setDescription([
-          '**Natural Language (just paste it):**',
+          '**Natural Language (just paste it, no ! needed):**',
           '`Buy "Rinderknech" on Polymarket: https://polymarket.com/event/...` — Buy $' + DEFAULT_BUY_AMOUNT + ' (default)',
           '`Buy "Rinderknech" on Polymarket: https://polymarket.com/event/... for $10` — Buy $10',
           '`Buy $10 of "Rinderknech" on Polymarket: https://polymarket.com/event/...` — Buy $10',
