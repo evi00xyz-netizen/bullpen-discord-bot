@@ -1,0 +1,13 @@
+version: '3.8'
+services:
+  bullpen-bot:
+    build: .
+    container_name: bullpen-discord-bot
+    restart: unless-stopped
+    env_file: .env
+    volumes:
+      - bullpen-home:/root/.bullpen
+    environment:
+      - BULLPEN_HOME=/root/.bullpen
+volumes:
+  bullpen-home:
