@@ -24,61 +24,83 @@ if (!TRADE_CHANNEL_ID) { console.error('Missing TRADE_CHANNEL_ID'); process.exit
 const useWsl = BULLPEN_USE_WSL.toLowerCase() === 'true';
 const confirmTimeoutSec = parseInt(CONFIRM_TIMEOUT, 10) || 30;
 
-function roundAmount(amount) {
-  return Math.round(parseFloat(amount) * 100) / 100;
-}
-function fmtAmount(amount) {
-  return roundAmount(amount).toFixed(2);
-}
-function fmtPrice(price) {
-  return (Math.round(parseFloat(price) * 100) / 100).toFixed(2);
-}
+function roundAmount(amount) { return Math.round(parseFloat(amount) * 100) / 100; }
+function fmtAmount(amount) { return roundAmount(amount).toFixed(2); }
+function fmtPrice(price) { return (Math.round(parseFloat(price) * 100) / 100).toFixed(2); }
 function fmtDisplay(value, decimals = 2) {
   const n = parseFloat(value);
   if (isNaN(n)) return String(value);
   return parseFloat(n.toFixed(decimals)).toString();
 }
 
-// --- THE FIX: ceil price to 2 decimals for --max-price so fill stays under limit ---
-// Then find clean USDC amount where shares = amount/price has <=6 decimals.
-// Math: price P (2dp) = p/100 (int), amount A (2dp) = a/100 (int)
-// shares = a/p, clean when (a * 1e6) mod p == 0
-function computeCleanBuy(targetAmount, rawPrice) {
+// --- GCD ---
+function gcd(a, b) {
+  a = Math.abs(Math.round(a));
+  b = Math.abs(Math.round(b));
+  while (b) { [a, b] = [b, a % b]; }
+  return a || 1;
+}
+
+// --- THE REAL FIX: compute clean amounts at the EXACT preview price ---
+// The CLOB fills at the market price (e.g. 0.8825), not at --max-price.
+// --max-price is just a ceiling. So we must find amounts where
+// amount / exact_price has <= 6 decimal places.
+//
+// Math: price P = num/den (simplified fraction, e.g. 0.8825 = 353/400)
+//       shares = amount / P = amount * den / num
+//       amount in cents: shares = cents * den / (100 * num)
+//       For <= 6 decimals: (cents * den * 1e6) % (100 * num) == 0
+//       Simplify: step = (100 * num) / gcd(den * 1e6, 100 * num)
+//       Clean amounts are multiples of `step` cents.
+function computeCleanBuyAtExactPrice(targetAmount, exactPrice) {
   const target = roundAmount(targetAmount);
   const targetCents = Math.round(target * 100);
-  const ceilPrice = Math.ceil(parseFloat(rawPrice) * 100) / 100;
 
-  console.log(`[computeCleanBuy] target=$${target.toFixed(2)}, rawPrice=${rawPrice}, ceilPrice=${ceilPrice}`);
+  // Convert price to fraction
+  const priceStr = parseFloat(exactPrice).toString();
+  const decimalPlaces = (priceStr.split('.')[1] || '').length;
+  const denominator = Math.pow(10, decimalPlaces);
+  const numerator = Math.round(parseFloat(exactPrice) * denominator);
 
-  if (ceilPrice <= 0 || ceilPrice >= 1) {
-    return { amount: target, price: null, shares: null, adjusted: false };
+  // Simplify fraction
+  const g = gcd(numerator, denominator);
+  const num = numerator / g;
+  const den = denominator / g;
+
+  // shares = cents * den / (100 * num)
+  // For <= 6 decimals: (cents * den * 1e6) % (100 * num) == 0
+  const modulus = 100 * num;
+  const multiplier = den * 1000000;
+  const g2 = gcd(multiplier, modulus);
+  const step = modulus / g2; // minimum step in cents
+
+  // Find nearest clean amounts
+  const below = Math.floor(targetCents / step) * step;
+  const above = Math.ceil(targetCents / step) * step;
+
+  let best;
+  if (below <= 0) {
+    best = above;
+  } else if ((targetCents - below) <= (above - targetCents)) {
+    best = below;
+  } else {
+    best = above;
   }
 
-  const p = Math.round(ceilPrice * 100);
+  const shares = (best * den) / (100 * num);
+  const ceilPrice = Math.ceil(parseFloat(exactPrice) * 100) / 100;
 
-  // Check if target itself is clean
-  if ((targetCents * 1e6) % p === 0) {
-    const shares = targetCents / p;
-    console.log(`[computeCleanBuy] EXACT: price=${ceilPrice}, $${target.toFixed(2)} -> ${shares} shares`);
-    return { amount: target, price: ceilPrice, shares, adjusted: false };
-  }
+  console.log(`[computeCleanBuyAtExactPrice] price=${exactPrice} = ${num}/${den}, step=${step} cents=$${(step/100).toFixed(2)}, target=$${target.toFixed(2)}, nearest=$${(best/100).toFixed(2)}, shares=${shares}, ceilPrice=${ceilPrice}`);
 
-  // Search outward in 1-cent increments
-  for (let delta = 1; delta <= 10000; delta++) {
-    for (const sign of [1, -1]) {
-      const testCents = targetCents + sign * delta;
-      if (testCents <= 0) continue;
-      if ((testCents * 1e6) % p === 0) {
-        const testAmount = testCents / 100;
-        const shares = testCents / p;
-        console.log(`[computeCleanBuy] FOUND: price=${ceilPrice}, $${testAmount.toFixed(2)} -> ${shares} shares (delta=${sign * delta}c)`);
-        return { amount: testAmount, price: ceilPrice, shares, adjusted: true };
-      }
-    }
-  }
-
-  console.log(`[computeCleanBuy] NO clean amount found, falling back`);
-  return { amount: target, price: ceilPrice, shares: null, adjusted: false };
+  return {
+    amount: best / 100,
+    shares: shares,
+    step: step / 100,
+    ceilPrice: ceilPrice,
+    adjusted: best !== targetCents,
+    below: below > 0 ? below / 100 : null,
+    above: above / 100,
+  };
 }
 
 // --- Auto-detect bullpen binary path ---
@@ -272,10 +294,10 @@ function buildPreviewEmbed(cmd, result) {
     { name: 'Outcome', value: String(outcome), inline: true },
     { name: 'Amount', value: amount !== 'N/A' ? `$${fmtDisplay(amount, 2)}` : `$${fmtAmount(cmd.amount)}`, inline: true },
   );
-  if (info.price) embed.addFields({ name: 'Price', value: `${fmtDisplay(info.price, 2)}c`, inline: true });
+  if (info.price) embed.addFields({ name: 'Price', value: `${fmtDisplay(info.price, 4)}c`, inline: true });
   if (info.shares) embed.addFields({ name: 'Est. Shares', value: fmtDisplay(info.shares, 2), inline: true });
   if (info.potential) embed.addFields({ name: 'Potential', value: `$${fmtDisplay(info.potential, 2)}`, inline: true });
-  if (info.spread) embed.addFields({ name: 'Spread', value: `${fmtDisplay(info.spread, 2)}c`, inline: true });
+  if (info.spread) embed.addFields({ name: 'Spread', value: `${fmtDisplay(info.spread, 4)}c`, inline: true });
   embed.setFooter({ text: `Type "y" to confirm - or anything else to cancel (${confirmTimeoutSec}s timeout)` });
   return embed;
 }
@@ -303,7 +325,7 @@ function buildTradeEmbed(cmd, result) {
     { name: 'Spent', value: amount !== 'N/A' ? `$${fmtDisplay(amount, 2)}` : `$${fmtAmount(cmd.amount)}`, inline: true },
   );
   if (info.shares) embed.addFields({ name: 'Shares', value: fmtDisplay(info.shares, 2), inline: true });
-  if (info.price) embed.addFields({ name: 'Fill Price', value: `${fmtDisplay(info.price, 2)}c`, inline: true });
+  if (info.price) embed.addFields({ name: 'Fill Price', value: `${fmtDisplay(info.price, 4)}c`, inline: true });
   if (info.potential) embed.addFields({ name: 'Potential', value: `$${fmtDisplay(info.potential, 2)}`, inline: true });
   if (info.orderId) embed.addFields({ name: 'Order ID', value: `\`${String(info.orderId).slice(0, 50)}\``, inline: true });
   return embed;
@@ -330,7 +352,7 @@ function buildSellEmbed(cmd, result, isPreview) {
     { name: 'Status', value: isPreview ? 'Preview' : 'Filled', inline: true },
   );
   if (info.shares) embed.addFields({ name: 'Shares', value: fmtDisplay(info.shares, 2), inline: true });
-  if (info.price) embed.addFields({ name: 'Price', value: `${fmtDisplay(info.price, 2)}c`, inline: true });
+  if (info.price) embed.addFields({ name: 'Price', value: `${fmtDisplay(info.price, 4)}c`, inline: true });
   if (info.amount) embed.addFields({ name: 'Received', value: `$${fmtDisplay(info.amount, 2)}`, inline: true });
   return embed;
 }
@@ -444,23 +466,56 @@ async function doBuyWithConfirm(msg, slug, outcome, amount, maxPrice, marketLabe
   if (!previewResult.ok) return;
 
   const previewPrice = extractPrice(previewResult.stdout);
-  const previewShares = extractShares(previewResult.stdout);
-  console.log(`[doBuyWithConfirm] extracted price=${previewPrice}, shares=${previewShares}`);
+  console.log(`[doBuyWithConfirm] extracted price=${previewPrice}`);
 
   let execAmount = amount;
   let execMaxPrice = maxPrice;
 
   if (previewPrice) {
-    // Ceil the price so fill stays under max-price limit
-    const clean = computeCleanBuy(amount, previewPrice);
+    // Compute clean amount at the EXACT preview price (not rounded)
+    const clean = computeCleanBuyAtExactPrice(amount, previewPrice);
     execAmount = clean.amount;
-    execMaxPrice = clean.price; // always use ceil'd price as max-price
+    execMaxPrice = clean.ceilPrice; // ceil to 2 decimals for price protection
 
     if (clean.adjusted) {
-      await msg.channel.send(`Adjusted for CLOB precision: $${fmtAmount(clean.amount)} at ${fmtPrice(clean.price)} -> ${fmtDisplay(clean.shares, 6)} shares (clean)`);
-    } else if (clean.price && Math.abs(clean.price - previewPrice) > 0.001) {
-      await msg.channel.send(`Using rounded max-price ${fmtPrice(clean.price)} (fill price was ${previewPrice})`);
+      const pctChange = Math.abs(clean.amount - amount) / amount * 100;
+      console.log(`[doBuyWithConfirm] adjusted: $${amount.toFixed(2)} -> $${clean.amount.toFixed(2)} (${pctChange.toFixed(1)}% change), shares=${clean.shares}`);
+
+      if (pctChange > 50) {
+        // Large adjustment — inform user and ask
+        await msg.channel.send(
+          `**CLOB precision adjustment required**\n` +
+          `Market price ${previewPrice} requires buys in $${clean.step.toFixed(2)} increments.\n` +
+          `Nearest clean amount: **$${fmtAmount(clean.amount)}** (${fmtDisplay(clean.shares, 2)} shares)\n` +
+          `Original target was $${fmtAmount(amount)}.\n\n` +
+          `Type **y** to buy $${fmtAmount(clean.amount)}, or anything else to cancel.`
+        );
+
+        try {
+          const collected = await msg.channel.awaitMessages({
+            filter: (m) => m.author.id === msg.author.id,
+            max: 1,
+            time: confirmTimeoutSec * 1000,
+            errors: ['time'],
+          });
+          const response = collected.first();
+          if (response.content.trim().toLowerCase() !== 'y' && response.content.trim().toLowerCase() !== 'yes') {
+            await msg.channel.send('Trade cancelled.');
+            return;
+          }
+        } catch {
+          await msg.channel.send('Trade cancelled - timed out.');
+          return;
+        }
+      } else {
+        await msg.channel.send(
+          `Adjusted for CLOB precision: $${fmtAmount(amount)} -> **$${fmtAmount(clean.amount)}** at ${fmtPrice(clean.ceilPrice)} (${fmtDisplay(clean.shares, 2)} shares)`
+        );
+      }
+    } else if (clean.ceilPrice && Math.abs(clean.ceilPrice - previewPrice) > 0.001) {
+      await msg.channel.send(`Using max-price ${fmtPrice(clean.ceilPrice)} (fill price ${previewPrice})`);
     }
+
     console.log(`[doBuyWithConfirm] exec: amount=$${fmtAmount(execAmount)}, maxPrice=${execMaxPrice}`);
   }
 
@@ -486,13 +541,12 @@ async function doBuyWithConfirm(msg, slug, outcome, amount, maxPrice, marketLabe
       console.log(`[doBuyWithConfirm] attempt 1: amount=$${fmtAmount(execAmount)}, maxPrice=${execMaxPrice}`);
       let execResult = await executeBuy(slug, outcome, execAmount, execMaxPrice);
 
-      // Attempt 2: if price protection error, bump max-price up by 1 cent
+      // Attempt 2: if price protection error, bump max-price up 1 cent
       if (!execResult.ok && isPriceProtectionError(execResult) && execMaxPrice) {
         const bumpedPrice = roundAmount(execMaxPrice + 0.01);
-        console.log(`[doBuyWithConfirm] attempt 1 price protection, bumping max-price to ${bumpedPrice}`);
+        console.log(`[doBuyWithConfirm] price protection, bumping max-price to ${bumpedPrice}`);
         await msg.channel.send(`Bumping max-price to ${fmtPrice(bumpedPrice)}...`);
-        // Recompute clean amount at new price
-        const clean2 = computeCleanBuy(execAmount, bumpedPrice);
+        const clean2 = computeCleanBuyAtExactPrice(execAmount, bumpedPrice);
         execResult = await executeBuy(slug, outcome, clean2.amount, bumpedPrice);
       }
 
@@ -503,24 +557,11 @@ async function doBuyWithConfirm(msg, slug, outcome, amount, maxPrice, marketLabe
         execResult = await executeBuy(slug, outcome, execAmount, null);
       }
 
-      // Attempt 4: original amount with ceil'd max-price
+      // Attempt 4: try with max-price 0.99 (near-market ceiling)
       if (!execResult.ok && isDecimalError(execResult)) {
-        console.log(`[doBuyWithConfirm] trying original amount $${fmtAmount(amount)} with maxPrice=${execMaxPrice}`);
-        await msg.channel.send('Retrying with original amount...');
-        execResult = await executeBuy(slug, outcome, amount, execMaxPrice);
-      }
-
-      // Attempt 5: original amount without max-price
-      if (!execResult.ok && isDecimalError(execResult)) {
-        console.log(`[doBuyWithConfirm] trying original amount without maxPrice`);
-        execResult = await executeBuy(slug, outcome, amount, null);
-      }
-
-      // Attempt 6: if price protection, try with 0.99 max-price (near market)
-      if (!execResult.ok && isPriceProtectionError(execResult)) {
-        console.log(`[doBuyWithConfirm] price protection, trying with max-price 0.99`);
+        console.log(`[doBuyWithConfirm] trying with max-price 0.99`);
         await msg.channel.send('Retrying with max-price 0.99...');
-        const clean3 = computeCleanBuy(amount, 0.99);
+        const clean3 = computeCleanBuyAtExactPrice(execAmount, 0.99);
         execResult = await executeBuy(slug, outcome, clean3.amount, 0.99);
       }
 
@@ -531,7 +572,7 @@ async function doBuyWithConfirm(msg, slug, outcome, amount, maxPrice, marketLabe
     }
   } catch (err) {
     pendingConfirms.delete(confirmKey);
-    await msg.channel.send('Trade cancelled - confirmation timed out.');
+    await msg.channel.send('Trade cancelled - timed out.');
   }
 }
 
