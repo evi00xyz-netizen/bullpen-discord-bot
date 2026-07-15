@@ -46,36 +46,46 @@ function fmtDisplay(value, decimals = 2) {
   return parseFloat(n.toFixed(decimals)).toString();
 }
 
+// --- Check if shares (amount/price) fits in 6 decimal places ---
+function isCleanAmount(amount, price) {
+  const shares = amount / price;
+  const rounded = Math.round(shares * 1e6) / 1e6;
+  return Math.abs(shares - rounded) < 1e-9;
+}
+
 // --- Find nearest amount (2 decimals) where amount/price has ≤ 6 decimals ---
-// Searches bidirectionally (higher and lower) and picks the closest to target
+// Searches bidirectionally and picks the closest to target
 function findCleanAmount(targetAmount, price) {
   const p = parseFloat(price);
-  if (!p || p <= 0) return roundAmount(targetAmount);
+  if (!p || p <= 0) {
+    console.log(`[findCleanAmount] invalid price: ${price}`);
+    return roundAmount(targetAmount);
+  }
 
   const target = roundAmount(targetAmount);
+  console.log(`[findCleanAmount] target=$${target.toFixed(2)}, price=${p}`);
 
   // Check if target itself is clean
-  const targetShares = target / p;
-  if (Math.abs(targetShares - Math.round(targetShares * 1e6) / 1e6) < 1e-10) {
+  if (isCleanAmount(target, p)) {
+    console.log(`[findCleanAmount] target $${target.toFixed(2)} is already clean`);
     return target;
   }
 
-  // Search outward in both directions, $0.01 at a time, up to $5.00 away
-  for (let delta = 1; delta <= 500; delta++) {
+  // Search outward in both directions, $0.01 at a time, up to $10.00 away
+  for (let delta = 1; delta <= 1000; delta++) {
     for (const sign of [1, -1]) {
       const testAmount = Math.round((target + sign * delta * 0.01) * 100) / 100;
       if (testAmount <= 0) continue;
-      const testShares = testAmount / p;
-      const testSharesRounded = Math.round(testShares * 1e6) / 1e6;
-      if (Math.abs(testShares - testSharesRounded) < 1e-10) {
-        console.log(`Found clean amount: $${testAmount.toFixed(2)} → ${testSharesRounded} shares (target was $${target.toFixed(2)})`);
+      if (isCleanAmount(testAmount, p)) {
+        const shares = testAmount / p;
+        console.log(`[findCleanAmount] FOUND clean: $${testAmount.toFixed(2)} → ${shares} shares (delta=$${(sign * delta * 0.01).toFixed(2)})`);
         return testAmount;
       }
     }
   }
 
   // No clean amount found, return original
-  console.log(`No clean amount found near $${target.toFixed(2)} at price ${p}, using original`);
+  console.log(`[findCleanAmount] NO clean amount found near $${target.toFixed(2)} at price ${p}`);
   return target;
 }
 
@@ -162,13 +172,17 @@ async function runBullpen(args) {
     binArgs = args;
   }
 
+  console.log(`[runBullpen] ${bin} ${binArgs.join(' ')}`);
+
   try {
     const { stdout } = await execFileAsync(bin, binArgs, {
       env, timeout: 60000, maxBuffer: 1024 * 1024 * 5,
     });
+    console.log(`[runBullpen] OK, stdout length: ${stdout.length}`);
     return { ok: true, stdout };
   } catch (err) {
     const realError = err.stderr || err.stdout || err.message;
+    console.log(`[runBullpen] FAILED: ${String(realError).slice(0, 300)}`);
     return { ok: false, stdout: err.stdout || '', stderr: realError };
   }
 }
@@ -223,6 +237,67 @@ function parseBullpenResult(stdout) {
   } catch {
     return null;
   }
+}
+
+// --- Extract price from bullpen output (try every possible field) ---
+function extractPrice(stdout) {
+  const data = parseBullpenResult(stdout);
+  if (data) {
+    // Try every possible price field
+    const candidates = [
+      data.price, data.avg_price, data.fill_price, data.execution_price,
+      data.best_price, data.order_price, data.match_price,
+      data.preview?.price, data.preview?.avg_price,
+      data.order?.price, data.order?.avg_price,
+      data.result?.price, data.result?.avg_price,
+      data.trade?.price, data.trade?.avg_price,
+    ];
+    for (const c of candidates) {
+      if (c !== undefined && c !== null && !isNaN(parseFloat(c))) {
+        console.log(`[extractPrice] found price in JSON: ${c}`);
+        return parseFloat(c);
+      }
+    }
+  }
+  // Fallback: regex on text
+  const text = stdout || '';
+  const priceMatch = text.match(/Price:?\s*\$?([\d.]+)/i);
+  if (priceMatch) {
+    console.log(`[extractPrice] found price via regex: ${priceMatch[1]}`);
+    return parseFloat(priceMatch[1]);
+  }
+  // Try "at X¢" or "@ X¢" format
+  const atMatch = text.match(/(?:at|@)\s*([\d.]+)\s*¢/i);
+  if (atMatch) {
+    console.log(`[extractPrice] found price via 'at X¢': ${atMatch[1]}`);
+    return parseFloat(atMatch[1]);
+  }
+  console.log(`[extractPrice] could not extract price from stdout`);
+  return null;
+}
+
+// --- Extract shares from bullpen output ---
+function extractShares(stdout) {
+  const data = parseBullpenResult(stdout);
+  if (data) {
+    const candidates = [
+      data.shares, data.fill_amount, data.filled, data.est_shares,
+      data.estimated_shares, data.amount_bought, data.size,
+      data.preview?.shares, data.preview?.est_shares,
+      data.order?.shares, data.result?.shares,
+    ];
+    for (const c of candidates) {
+      if (c !== undefined && c !== null && !isNaN(parseFloat(c))) {
+        return parseFloat(c);
+      }
+    }
+  }
+  const text = stdout || '';
+  const sharesMatch = text.match(/(?:Est\.?\s*)?shares:?\s*([\d.]+)/i);
+  if (sharesMatch) return parseFloat(sharesMatch[1]);
+  const filledMatch = text.match(/Filled:?\s*([\d.]+)/i);
+  if (filledMatch) return parseFloat(filledMatch[1]);
+  return null;
 }
 
 // --- Extract info from bullpen output (JSON or text) ---
@@ -532,10 +607,19 @@ function buildEmbedFromSummary(summary) {
   return embed;
 }
 
+// --- Check if error is the decimal precision error ---
+function isDecimalError(result) {
+  const text = ((result.stderr || '') + ' ' + (result.stdout || '')).toLowerCase();
+  return text.includes('decimal') || text.includes('invalid amounts') || text.includes('max accuracy');
+}
+
 // --- Interactive buy: preview, wait for "y", then execute with clean amount ---
 async function doBuyWithConfirm(msg, slug, outcome, amount, maxPrice, marketLabel) {
   await msg.channel.sendTyping();
   const previewResult = await previewBuy(slug, outcome, amount, maxPrice);
+
+  console.log(`[doBuyWithConfirm] preview ok=${previewResult.ok}`);
+  console.log(`[doBuyWithConfirm] preview stdout (first 500): ${(previewResult.stdout || '').slice(0, 500)}`);
 
   const previewEmbed = buildPreviewEmbed({ slug, market: marketLabel, outcome, amount }, previewResult);
   await msg.channel.send({ embeds: [previewEmbed] });
@@ -545,17 +629,28 @@ async function doBuyWithConfirm(msg, slug, outcome, amount, maxPrice, marketLabe
   }
 
   // Extract price from preview to compute clean amount
-  const info = extractTradeInfo(previewResult.stdout);
-  let execAmount = amount;
-  let adjusted = false;
+  const previewPrice = extractPrice(previewResult.stdout);
+  const previewShares = extractShares(previewResult.stdout);
 
-  if (info.price) {
-    const cleanAmt = findCleanAmount(amount, info.price);
+  console.log(`[doBuyWithConfirm] extracted price=${previewPrice}, shares=${previewShares}`);
+
+  let execAmount = amount;
+  let adjustedMsg = '';
+
+  if (previewPrice) {
+    const cleanAmt = findCleanAmount(amount, previewPrice);
+    console.log(`[doBuyWithConfirm] cleanAmt=${cleanAmt}, original=${roundAmount(amount)}`);
     if (Math.abs(cleanAmt - roundAmount(amount)) > 0.001) {
       execAmount = cleanAmt;
-      adjusted = true;
-      await msg.channel.send(`⚠️ Adjusting amount from $${fmtAmount(amount)} to $${fmtAmount(execAmount)} for CLOB precision (shares must be ≤ 6 decimals).`);
+      const cleanShares = execAmount / previewPrice;
+      adjustedMsg = `⚠️ Adjusted $${fmtAmount(amount)} → $${fmtAmount(execAmount)} for CLOB precision (${fmtDisplay(cleanShares, 6)} shares, ≤6 decimals).`;
+      console.log(`[doBuyWithConfirm] ${adjustedMsg}`);
+      await msg.channel.send(adjustedMsg);
+    } else {
+      console.log(`[doBuyWithConfirm] original amount is already clean, no adjustment needed`);
     }
+  } else {
+    console.log(`[doBuyWithConfirm] could not extract price from preview, skipping clean amount calculation`);
   }
 
   await msg.channel.send(`Type **y** to confirm this trade, or anything else to cancel (${confirmTimeoutSec}s timeout)...`);
@@ -577,24 +672,40 @@ async function doBuyWithConfirm(msg, slug, outcome, amount, maxPrice, marketLabe
     if (response.content.trim().toLowerCase() === 'y' || response.content.trim().toLowerCase() === 'yes') {
       await msg.channel.send('⏳ Executing trade...');
 
-      // First attempt with clean amount
+      // Attempt 1: clean amount with maxPrice (if specified)
+      console.log(`[doBuyWithConfirm] attempt 1: amount=$${fmtAmount(execAmount)}, maxPrice=${maxPrice}`);
       let execResult = await executeBuy(slug, outcome, execAmount, maxPrice);
 
-      // If still fails with decimal error, try without max-price
-      if (!execResult.ok) {
-        const errText = (execResult.stderr || execResult.stdout || '').toLowerCase();
-        if (errText.includes('decimal') || errText.includes('invalid amounts')) {
-          console.log('First attempt failed with decimal error, retrying without --max-price...');
-          execResult = await executeBuy(slug, outcome, execAmount, null);
-        }
+      // Attempt 2: if decimal error, try clean amount WITHOUT maxPrice
+      if (!execResult.ok && isDecimalError(execResult)) {
+        console.log(`[doBuyWithConfirm] attempt 1 failed with decimal error, retrying without --max-price`);
+        await msg.channel.send('⚠️ Retrying without price limit...');
+        execResult = await executeBuy(slug, outcome, execAmount, null);
       }
 
-      // If still fails, try with original amount (no clean adjustment)
-      if (!execResult.ok) {
-        const errText = (execResult.stderr || execResult.stdout || '').toLowerCase();
-        if (errText.includes('decimal') || errText.includes('invalid amounts')) {
-          console.log('Still failing, trying original amount without adjustments...');
-          execResult = await executeBuy(slug, outcome, amount, null);
+      // Attempt 3: if still decimal error, try original amount without maxPrice
+      if (!execResult.ok && isDecimalError(execResult)) {
+        console.log(`[doBuyWithConfirm] attempt 2 failed, trying original amount $${fmtAmount(amount)} without maxPrice`);
+        await msg.channel.send('⚠️ Retrying with original amount...');
+        execResult = await executeBuy(slug, outcome, amount, null);
+      }
+
+      // Attempt 4: if still decimal error, try computing amount from rounded shares
+      if (!execResult.ok && isDecimalError(execResult) && previewPrice && previewShares) {
+        const roundedShares = Math.round(previewShares * 1e6) / 1e6;
+        const computedAmount = roundAmount(roundedShares * previewPrice);
+        console.log(`[doBuyWithConfirm] attempt 3 failed, trying computed amount $${computedAmount} from rounded shares ${roundedShares}`);
+        await msg.channel.send(`⚠️ Retrying with computed amount $${fmtAmount(computedAmount)}...`);
+        execResult = await executeBuy(slug, outcome, computedAmount, null);
+      }
+
+      // Attempt 5: try a clean amount computed from preview price, searching wider
+      if (!execResult.ok && isDecimalError(execResult) && previewPrice) {
+        const cleanAmt = findCleanAmount(amount, previewPrice);
+        if (Math.abs(cleanAmt - roundAmount(amount)) > 0.001) {
+          console.log(`[doBuyWithConfirm] attempt 4 failed, trying clean amount $${cleanAmt}`);
+          await msg.channel.send(`⚠️ Retrying with clean amount $${fmtAmount(cleanAmt)}...`);
+          execResult = await executeBuy(slug, outcome, cleanAmt, null);
         }
       }
 
