@@ -70,8 +70,6 @@ const client = new Client({
 
 // --- Extract slug from Polymarket URL ---
 function extractSlugFromUrl(url) {
-  // https://polymarket.com/event/atp-rinderk-tabur-2026-07-15-first-set-winner-rinderknech-vs-tabur
-  // https://polymarket.com/market/some-market-slug
   let m = url.match(/polymarket\.com\/event\/([^\s?]+)/i);
   if (m) return { slug: m[1], type: 'event' };
   m = url.match(/polymarket\.com\/market\/([^\s?]+)/i);
@@ -130,23 +128,36 @@ async function searchMarket(query) {
   }
 }
 
-// --- Get event details (find market slug from event slug) ---
-async function getEventMarkets(eventSlug) {
-  const { ok, stdout, stderr } = await runBullpen([
-    'polymarket', 'event', eventSlug, '--output', 'json',
-  ]);
-  if (!ok) return { ok: false, error: stderr || stdout };
-  try {
-    const data = JSON.parse(stdout);
-    return { ok: true, data };
-  } catch {
-    return { ok: false, error: 'Failed to parse event data' };
-  }
+// --- Buy shares ---
+// bullpen trade buy <MARKET_SLUG> <outcome> <amount> --yes --output json
+// bullpen trade buy <MARKET_SLUG> <outcome> <amount> --max-price 0.20 --yes --output json
+async function buyShares(slug, outcome, amount, maxPrice) {
+  const args = ['trade', 'buy', slug, outcome, String(amount)];
+  if (maxPrice) args.push('--max-price', String(maxPrice));
+  args.push('--yes', '--output', 'json');
+  return runBullpen(args);
 }
 
-// --- Buy shares ---
-async function buyShares(slug, outcome, amount) {
-  return runBullpen(['trade', 'buy', slug, outcome, String(amount), '--yes', '--output', 'json']);
+// --- Preview buy (no money moves) ---
+// bullpen trade buy <MARKET_SLUG> <outcome> <amount> --preview --output json
+async function previewBuy(slug, outcome, amount, maxPrice) {
+  const args = ['trade', 'buy', slug, outcome, String(amount)];
+  if (maxPrice) args.push('--max-price', String(maxPrice));
+  args.push('--preview', '--output', 'json');
+  return runBullpen(args);
+}
+
+// --- Sell shares ---
+// bullpen trade sell <MARKET_SLUG> <outcome> --max --yes --output json
+// bullpen trade sell <MARKET_SLUG> <outcome> --max --preview --output json
+async function sellShares(slug, outcome, maxShares, preview) {
+  const args = ['trade', 'sell', slug, outcome];
+  if (maxShares === 'max') args.push('--max');
+  else if (maxShares) args.push(String(maxShares));
+  if (preview) args.push('--preview');
+  else args.push('--yes');
+  args.push('--output', 'json');
+  return runBullpen(args);
 }
 
 // --- Parse commands ---
@@ -154,25 +165,25 @@ function parseCommand(content) {
   const t = content.trim();
   if (!t.startsWith('!')) return null;
 
-  // !buy-url <url> <outcome> <amount>
-  let m = t.match(/^!buy-url\s+(https?:\/\/\S+)\s+(\w+)\s+([\d.]+)$/i);
-  if (m) return { type: 'buy-url', url: m[1], outcome: m[2].toUpperCase(), amount: parseFloat(m[3]) };
+  // !buy-url <url> <outcome> <amount> [--max-price 0.20]
+  let m = t.match(/^!buy-url\s+(https?:\/\/\S+)\s+(\w+)\s+([\d.]+)(?:\s+--max-price\s+([\d.]+))?$/i);
+  if (m) return { type: 'buy-url', url: m[1], outcome: m[2].toUpperCase(), amount: parseFloat(m[3]), maxPrice: m[4] ? parseFloat(m[4]) : null };
 
-  // !buy "Rinderknech" https://polymarket.com/event/... 10
-  m = t.match(/^!buy\s+"([^"]+)"\s+(https?:\/\/\S+)\s+([\d.]+)$/i);
-  if (m) return { type: 'buy-url', outcome: m[1].toUpperCase(), url: m[2], amount: parseFloat(m[3]) };
+  // !buy "Rinderknech" https://polymarket.com/event/... 10 [--max-price 0.20]
+  m = t.match(/^!buy\s+"([^"]+)"\s+(https?:\/\/\S+)\s+([\d.]+)(?:\s+--max-price\s+([\d.]+))?$/i);
+  if (m) return { type: 'buy-url', outcome: m[1].toUpperCase(), url: m[2], amount: parseFloat(m[3]), maxPrice: m[4] ? parseFloat(m[4]) : null };
 
-  // !buy "Market Name" YES 10
-  m = t.match(/^!buy\s+"([^"]+)"\s+(\w+)\s+([\d.]+)$/i);
-  if (m) return { type: 'buy', market: m[1], outcome: m[2].toUpperCase(), amount: parseFloat(m[3]) };
+  // !buy "Market Name" YES 10 [--max-price 0.20]
+  m = t.match(/^!buy\s+"([^"]+)"\s+(\w+)\s+([\d.]+)(?:\s+--max-price\s+([\d.]+))?$/i);
+  if (m) return { type: 'buy', market: m[1], outcome: m[2].toUpperCase(), amount: parseFloat(m[3]), maxPrice: m[4] ? parseFloat(m[4]) : null };
 
   // !buy Market Name YES 10 (no quotes)
-  m = t.match(/^!buy\s+(.+?)\s+(\w+)\s+([\d.]+)$/i);
-  if (m) return { type: 'buy', market: m[1].trim(), outcome: m[2].toUpperCase(), amount: parseFloat(m[3]) };
+  m = t.match(/^!buy\s+(.+?)\s+(\w+)\s+([\d.]+)(?:\s+--max-price\s+([\d.]+))?$/i);
+  if (m) return { type: 'buy', market: m[1].trim(), outcome: m[2].toUpperCase(), amount: parseFloat(m[3]), maxPrice: m[4] ? parseFloat(m[4]) : null };
 
-  // !buy-slug market-slug YES 10
-  m = t.match(/^!buy-slug\s+(\S+)\s+(\w+)\s+([\d.]+)$/i);
-  if (m) return { type: 'buy-slug', slug: m[1], outcome: m[2].toUpperCase(), amount: parseFloat(m[3]) };
+  // !buy-slug market-slug YES 10 [--max-price 0.20]
+  m = t.match(/^!buy-slug\s+(\S+)\s+(\w+)\s+([\d.]+)(?:\s+--max-price\s+([\d.]+))?$/i);
+  if (m) return { type: 'buy-slug', slug: m[1], outcome: m[2].toUpperCase(), amount: parseFloat(m[3]), maxPrice: m[4] ? parseFloat(m[4]) : null };
 
   // !trade buy $10 of YES on "Market Name"
   m = t.match(/^!trade\s+buy\s+\$([\d.]+)\s+of\s+(\w+)\s+on\s+"([^"]+)"$/i);
@@ -181,6 +192,22 @@ function parseCommand(content) {
   // !trade buy $10 of YES on Market Name
   m = t.match(/^!trade\s+buy\s+\$([\d.]+)\s+of\s+(\w+)\s+on\s+(.+)$/i);
   if (m) return { type: 'buy', market: m[3].trim(), outcome: m[2].toUpperCase(), amount: parseFloat(m[1]) };
+
+  // !preview "Market Name" YES 10 [--max-price 0.20]
+  m = t.match(/^!preview\s+"([^"]+)"\s+(\w+)\s+([\d.]+)(?:\s+--max-price\s+([\d.]+))?$/i);
+  if (m) return { type: 'preview', market: m[1], outcome: m[2].toUpperCase(), amount: parseFloat(m[3]), maxPrice: m[4] ? parseFloat(m[4]) : null };
+
+  // !preview-slug market-slug YES 10 [--max-price 0.20]
+  m = t.match(/^!preview-slug\s+(\S+)\s+(\w+)\s+([\d.]+)(?:\s+--max-price\s+([\d.]+))?$/i);
+  if (m) return { type: 'preview-slug', slug: m[1], outcome: m[2].toUpperCase(), amount: parseFloat(m[3]), maxPrice: m[4] ? parseFloat(m[4]) : null };
+
+  // !sell "Market Name" YES [max|amount] [--preview]
+  m = t.match(/^!sell\s+"([^"]+)"\s+(\w+)(?:\s+(max|[\d.]+))?(?:\s+--preview)?$/i);
+  if (m) return { type: 'sell', market: m[1], outcome: m[2].toUpperCase(), sellAmount: m[3] || 'max', preview: /--preview/i.test(t) };
+
+  // !sell-slug market-slug YES [max|amount] [--preview]
+  m = t.match(/^!sell-slug\s+(\S+)\s+(\w+)(?:\s+(max|[\d.]+))?(?:\s+--preview)?$/i);
+  if (m) return { type: 'sell-slug', slug: m[1], outcome: m[2].toUpperCase(), sellAmount: m[3] || 'max', preview: /--preview/i.test(t) };
 
   // !search bitcoin
   m = t.match(/^!search\s+(.+)$/i);
@@ -195,28 +222,28 @@ function parseCommand(content) {
 }
 
 // --- Trade result embed ---
-function buildTradeEmbed(cmd, result) {
+function buildTradeEmbed(cmd, result, isPreview) {
   const embed = new EmbedBuilder().setTimestamp();
+  const title = isPreview ? 'Trade Preview' : (result.ok ? 'Trade Executed' : 'Trade Failed');
+  const color = result.ok ? (isPreview ? 0x3498db : 0x00ff00) : 0xff0000;
+  embed.setColor(color).setTitle(title);
+
+  let info = '';
   if (result.ok) {
-    let fillInfo = '';
     try {
       const data = JSON.parse(result.stdout);
-      fillInfo = data.order || data.trade || data;
-    } catch { fillInfo = result.stdout.slice(0, 500); }
-    embed.setColor(0x00ff00).setTitle('Trade Executed').addFields(
-      { name: 'Market', value: cmd.slug || cmd.market || 'N/A', inline: true },
-      { name: 'Outcome', value: cmd.outcome, inline: true },
-      { name: 'Amount', value: `$${cmd.amount}`, inline: true },
-      { name: 'Result', value: '```' + (typeof fillInfo === 'string' ? fillInfo : JSON.stringify(fillInfo, null, 2)).slice(0, 1000) + '```' },
-    );
+      info = JSON.stringify(data, null, 2);
+    } catch { info = result.stdout.slice(0, 1000); }
   } else {
-    embed.setColor(0xff0000).setTitle('Trade Failed').addFields(
-      { name: 'Market', value: cmd.slug || cmd.market || 'N/A', inline: true },
-      { name: 'Outcome', value: cmd.outcome, inline: true },
-      { name: 'Amount', value: `$${cmd.amount}`, inline: true },
-      { name: 'Error', value: '```' + (result.stderr || result.stdout || 'Unknown error').slice(0, 1000) + '```' },
-    );
+    info = result.stderr || result.stdout || 'Unknown error';
   }
+
+  embed.addFields(
+    { name: 'Market', value: cmd.slug || cmd.market || 'N/A', inline: true },
+    { name: 'Outcome', value: cmd.outcome, inline: true },
+    { name: 'Amount', value: cmd.amount ? `$${cmd.amount}` : (cmd.sellAmount || 'max'), inline: true },
+    { name: isPreview ? 'Preview' : 'Result', value: '```' + info.slice(0, 1000) + '```' },
+  );
   return embed;
 }
 
@@ -232,15 +259,28 @@ client.on('messageCreate', async (msg) => {
     switch (cmd.type) {
       case 'help': {
         await msg.reply({ embeds: [new EmbedBuilder().setColor(0x3498db).setTitle('Bullpen Discord Bot Commands').setDescription([
-          '`!buy "Market Name" YES 10` — Buy $10 of YES on the named market',
-          '`!buy "Rinderknech" https://polymarket.com/event/... 10` — Buy $10 of an outcome by Polymarket URL',
+          '**Buying:**',
+          '`!buy "Market Name" YES 10` — Buy $10 of YES (auto-searches)',
+          '`!buy "Market Name" YES 10 --max-price 0.20` — Buy with max price limit',
+          '`!buy "Rinderknech" https://polymarket.com/event/... 10` — Buy by Polymarket URL',
           '`!buy-url https://polymarket.com/event/... YES 10` — Buy by URL (outcome first)',
           '`!buy-slug market-slug YES 10` — Buy by exact slug',
-          '`!trade buy $10 of YES on "Market Name"` — Natural language buy',
+          '',
+          '**Previewing (no money moves):**',
+          '`!preview "Market Name" YES 10` — Preview a buy',
+          '`!preview-slug market-slug YES 10` — Preview by slug',
+          '',
+          '**Selling:**',
+          '`!sell "Market Name" YES` — Sell all YES shares',
+          '`!sell "Market Name" YES 50` — Sell 50 shares',
+          '`!sell "Market Name" YES --preview` — Preview a sell',
+          '`!sell-slug market-slug YES` — Sell by slug',
+          '',
+          '**Other:**',
           '`!search Trump election` — Search Polymarket markets',
           '`!status` — Check Bullpen CLI status',
           '`!positions` — View your Polymarket positions',
-          '`!debug` — Show bot debug info (bullpen path, env, etc.)',
+          '`!debug` — Show bot debug info',
           '`!help` — Show this help',
         ].join('\n'))] });
         break;
@@ -319,45 +359,37 @@ client.on('messageCreate', async (msg) => {
           break;
         }
 
-        await msg.reply(`Found ${extracted.type} slug: \`${extracted.slug}\`. Buying **${cmd.outcome}** for $${cmd.amount}...`);
+        await msg.reply(`Found ${extracted.type} slug: \`${extracted.slug}\`. Buying **${cmd.outcome}** for $${cmd.amount}${cmd.maxPrice ? ` (max price $${cmd.maxPrice})` : ''}...`);
 
-        // For event URLs, try to find the specific market matching the outcome
-        if (extracted.type === 'event') {
-          // Try using the event slug directly with bullpen trade buy
-          const buyResult = await buyShares(extracted.slug, cmd.outcome, cmd.amount);
-          if (buyResult.ok) {
-            await msg.channel.send({ embeds: [buildTradeEmbed({ ...cmd, slug: extracted.slug }, buyResult)] });
-          } else {
-            // If direct event slug fails, try searching for the market
-            await msg.channel.send('Direct event slug failed, searching for specific market...');
-            const searchResult = await searchMarket(extracted.slug);
-            if (searchResult.ok && searchResult.markets.length > 0) {
-              // Find market matching the outcome
-              const matching = searchResult.markets.find(m => {
-                const title = (m.title || m.question || m.name || '').toLowerCase();
-                return title.includes(cmd.outcome.toLowerCase());
-              }) || searchResult.markets[0];
-              const slug = matching.slug || matching.market_slug || matching.id;
-              const title = matching.title || matching.question || matching.name || slug;
-              await msg.channel.send(`Found market: **${title}** (slug: \`${slug}\`). Executing buy ${cmd.outcome} for $${cmd.amount}...`);
-              const retryResult = await buyShares(slug, cmd.outcome, cmd.amount);
-              await msg.channel.send({ embeds: [buildTradeEmbed({ ...cmd, slug }, retryResult)] });
-            } else {
-              await msg.channel.send({ embeds: [new EmbedBuilder().setColor(0xff0000).setTimestamp().setTitle('Market Not Found').setDescription(`Could not find a market for event \`${extracted.slug}\`. Try \`!buy-slug ${extracted.slug} ${cmd.outcome} ${cmd.amount}\` manually.`)] });
-            }
-          }
-        } else {
-          // Market URL — use slug directly
-          const buyResult = await buyShares(extracted.slug, cmd.outcome, cmd.amount);
+        // Try using the slug directly with bullpen trade buy
+        const buyResult = await buyShares(extracted.slug, cmd.outcome, cmd.amount, cmd.maxPrice);
+        if (buyResult.ok) {
           await msg.channel.send({ embeds: [buildTradeEmbed({ ...cmd, slug: extracted.slug }, buyResult)] });
+        } else {
+          // If direct slug fails, try searching for the market
+          await msg.channel.send('Direct slug failed, searching for specific market...');
+          const searchResult = await searchMarket(extracted.slug);
+          if (searchResult.ok && searchResult.markets.length > 0) {
+            const matching = searchResult.markets.find(m => {
+              const title = (m.title || m.question || m.name || '').toLowerCase();
+              return title.includes(cmd.outcome.toLowerCase());
+            }) || searchResult.markets[0];
+            const slug = matching.slug || matching.market_slug || matching.id;
+            const title = matching.title || matching.question || matching.name || slug;
+            await msg.channel.send(`Found market: **${title}** (slug: \`${slug}\`). Executing buy ${cmd.outcome} for $${cmd.amount}...`);
+            const retryResult = await buyShares(slug, cmd.outcome, cmd.amount, cmd.maxPrice);
+            await msg.channel.send({ embeds: [buildTradeEmbed({ ...cmd, slug }, retryResult)] });
+          } else {
+            await msg.channel.send({ embeds: [new EmbedBuilder().setColor(0xff0000).setTimestamp().setTitle('Market Not Found').setDescription(`Could not find a market for \`${extracted.slug}\`. Try \`!buy-slug ${extracted.slug} ${cmd.outcome} ${cmd.amount}\` manually.`)] });
+          }
         }
         break;
       }
 
       case 'buy-slug': {
         await msg.channel.sendTyping();
-        await msg.reply(`Executing: buy ${cmd.outcome} on \`${cmd.slug}\` for $${cmd.amount}...`);
-        const result = await buyShares(cmd.slug, cmd.outcome, cmd.amount);
+        await msg.reply(`Executing: buy ${cmd.outcome} on \`${cmd.slug}\` for $${cmd.amount}${cmd.maxPrice ? ` (max price $${cmd.maxPrice})` : ''}...`);
+        const result = await buyShares(cmd.slug, cmd.outcome, cmd.amount, cmd.maxPrice);
         await msg.channel.send({ embeds: [buildTradeEmbed({ ...cmd, market: cmd.slug }, result)] });
         break;
       }
@@ -377,9 +409,69 @@ client.on('messageCreate', async (msg) => {
           break;
         }
         const title = first.title || first.question || first.name || slug;
-        await msg.channel.send(`Found: **${title}** (slug: \`${slug}\`). Executing buy ${cmd.outcome} for $${cmd.amount}...`);
-        const buyResult = await buyShares(slug, cmd.outcome, cmd.amount);
+        await msg.channel.send(`Found: **${title}** (slug: \`${slug}\`). Executing buy ${cmd.outcome} for $${cmd.amount}${cmd.maxPrice ? ` (max price $${cmd.maxPrice})` : ''}...`);
+        const buyResult = await buyShares(slug, cmd.outcome, cmd.amount, cmd.maxPrice);
         await msg.channel.send({ embeds: [buildTradeEmbed({ ...cmd, slug }, buyResult)] });
+        break;
+      }
+
+      case 'preview-slug': {
+        await msg.channel.sendTyping();
+        await msg.reply(`Previewing: buy ${cmd.outcome} on \`${cmd.slug}\` for $${cmd.amount}${cmd.maxPrice ? ` (max price $${cmd.maxPrice})` : ''}...`);
+        const result = await previewBuy(cmd.slug, cmd.outcome, cmd.amount, cmd.maxPrice);
+        await msg.channel.send({ embeds: [buildTradeEmbed({ ...cmd, market: cmd.slug }, result, true)] });
+        break;
+      }
+
+      case 'preview': {
+        await msg.channel.sendTyping();
+        await msg.reply(`Searching for "${cmd.market}"...`);
+        const searchResult = await searchMarket(cmd.market);
+        if (!searchResult.ok) {
+          await msg.channel.send({ embeds: [new EmbedBuilder().setColor(0xff0000).setTimestamp().setTitle('Market Not Found').setDescription(searchResult.error || 'No markets matched')] });
+          break;
+        }
+        const first = searchResult.markets[0];
+        const slug = first.slug || first.market_slug || first.id;
+        if (!slug) {
+          await msg.channel.send({ embeds: [new EmbedBuilder().setColor(0xff0000).setTimestamp().setTitle('No Slug Found').setDescription('Use `!preview-slug <slug> <outcome> <amount>` instead.')] });
+          break;
+        }
+        const title = first.title || first.question || first.name || slug;
+        await msg.channel.send(`Found: **${title}** (slug: \`${slug}\`). Previewing buy ${cmd.outcome} for $${cmd.amount}...`);
+        const previewResult = await previewBuy(slug, cmd.outcome, cmd.amount, cmd.maxPrice);
+        await msg.channel.send({ embeds: [buildTradeEmbed({ ...cmd, slug }, previewResult, true)] });
+        break;
+      }
+
+      case 'sell-slug': {
+        await msg.channel.sendTyping();
+        const sellStr = cmd.sellAmount === 'max' ? 'all' : `${cmd.sellAmount} shares`;
+        await msg.reply(`Executing: sell ${sellStr} of ${cmd.outcome} on \`${cmd.slug}\`${cmd.preview ? ' (preview)' : ''}...`);
+        const result = await sellShares(cmd.slug, cmd.outcome, cmd.sellAmount, cmd.preview);
+        await msg.channel.send({ embeds: [buildTradeEmbed({ ...cmd, market: cmd.slug, outcome: cmd.outcome, amount: cmd.sellAmount }, result, cmd.preview)] });
+        break;
+      }
+
+      case 'sell': {
+        await msg.channel.sendTyping();
+        await msg.reply(`Searching for "${cmd.market}"...`);
+        const searchResult = await searchMarket(cmd.market);
+        if (!searchResult.ok) {
+          await msg.channel.send({ embeds: [new EmbedBuilder().setColor(0xff0000).setTimestamp().setTitle('Market Not Found').setDescription(searchResult.error || 'No markets matched')] });
+          break;
+        }
+        const first = searchResult.markets[0];
+        const slug = first.slug || first.market_slug || first.id;
+        if (!slug) {
+          await msg.channel.send({ embeds: [new EmbedBuilder().setColor(0xff0000).setTimestamp().setTitle('No Slug Found').setDescription('Use `!sell-slug <slug> <outcome>` instead.')] });
+          break;
+        }
+        const title = first.title || first.question || first.name || slug;
+        const sellStr = cmd.sellAmount === 'max' ? 'all' : `${cmd.sellAmount} shares`;
+        await msg.channel.send(`Found: **${title}** (slug: \`${slug}\`). Selling ${sellStr} of ${cmd.outcome}${cmd.preview ? ' (preview)' : ''}...`);
+        const sellResult = await sellShares(slug, cmd.outcome, cmd.sellAmount, cmd.preview);
+        await msg.channel.send({ embeds: [buildTradeEmbed({ ...cmd, slug, market: cmd.market, outcome: cmd.outcome, amount: cmd.sellAmount }, sellResult, cmd.preview)] });
         break;
       }
     }
