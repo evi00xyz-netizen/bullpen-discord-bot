@@ -15,12 +15,14 @@ const {
   BULLPEN_ENV = 'production',
   BULLPEN_USE_WSL = 'false',
   DEFAULT_BUY_AMOUNT = '2',
+  CONFIRM_TIMEOUT = '30',
 } = process.env;
 
 if (!DISCORD_BOT_TOKEN) { console.error('Missing DISCORD_BOT_TOKEN'); process.exit(1); }
 if (!TRADE_CHANNEL_ID) { console.error('Missing TRADE_CHANNEL_ID'); process.exit(1); }
 
 const useWsl = BULLPEN_USE_WSL.toLowerCase() === 'true';
+const confirmTimeoutSec = parseInt(CONFIRM_TIMEOUT, 10) || 30;
 
 // --- Auto-detect bullpen binary path ---
 let resolvedBin = BULLPEN_BIN;
@@ -68,6 +70,9 @@ const client = new Client({
     GatewayIntentBits.MessageContent,
   ],
 });
+
+// --- Track pending confirmations: userId -> { slug, outcome, amount, maxPrice, marketLabel } ---
+const pendingConfirms = new Map();
 
 // --- Extract slug from Polymarket URL ---
 function extractSlugFromUrl(url) {
@@ -182,7 +187,6 @@ function extractTradeInfo(stdout) {
       raw: data,
     };
   }
-  // Try to parse from text output
   const text = stdout || '';
   const priceMatch = text.match(/Price:?\s*\$?([\d.]+)/i);
   const amountMatch = text.match(/Amount:?\s*\$?([\d.]+)/i);
@@ -242,6 +246,8 @@ function buildPreviewEmbed(cmd, result) {
   if (info.shares) embed.addFields({ name: 'Est. Shares', value: String(info.shares), inline: true });
   if (info.potential) embed.addFields({ name: 'Potential', value: `$${info.potential}`, inline: true });
   if (info.spread) embed.addFields({ name: 'Spread', value: `${info.spread}¢`, inline: true });
+
+  embed.setFooter({ text: `Type "y" to confirm — or anything else to cancel (${confirmTimeoutSec}s timeout)` });
 
   return embed;
 }
@@ -491,34 +497,67 @@ function buildEmbedFromSummary(summary) {
   return embed;
 }
 
-// --- Two-phase buy: try preview first, then execute ---
-// If preview fails, skip it and execute directly so the trade always goes through
-async function doBuyWithPreview(msg, slug, outcome, amount, maxPrice, marketLabel) {
-  // Phase 1: Try preview
+// --- Interactive buy: preview, wait for "y", then execute ---
+async function doBuyWithConfirm(msg, slug, outcome, amount, maxPrice, marketLabel) {
+  // Phase 1: Preview
   await msg.channel.sendTyping();
   const previewResult = await previewBuy(slug, outcome, amount, maxPrice);
 
-  if (previewResult.ok) {
-    // Preview succeeded — show it, then execute
-    const previewEmbed = buildPreviewEmbed({ slug, market: marketLabel, outcome, amount }, previewResult);
-    await msg.channel.send({ embeds: [previewEmbed] });
-    await msg.channel.send('⏳ Executing trade...');
-  } else {
-    // Preview failed — log it but don't block the trade
-    console.log('Preview failed, executing directly:', previewResult.stderr || previewResult.stdout);
-    await msg.channel.send('⏳ Executing trade...');
+  // Show preview embed (even if preview failed, show the error)
+  const previewEmbed = buildPreviewEmbed({ slug, market: marketLabel, outcome, amount }, previewResult);
+  await msg.channel.send({ embeds: [previewEmbed] });
+
+  // If preview failed, don't wait for confirmation
+  if (!previewResult.ok) {
+    return;
   }
 
-  // Phase 2: Execute (always runs)
-  const execResult = await executeBuy(slug, outcome, amount, maxPrice);
-  const execEmbed = buildTradeEmbed({ slug, market: marketLabel, outcome, amount }, execResult);
-  await msg.channel.send({ embeds: [execEmbed] });
+  // Phase 2: Wait for user confirmation
+  await msg.channel.send(`Type **y** to confirm this trade, or anything else to cancel (${confirmTimeoutSec}s timeout)...`);
+
+  // Store pending confirmation
+  const confirmKey = msg.author.id;
+  pendingConfirms.set(confirmKey, { slug, outcome, amount, maxPrice, marketLabel, channelId: msg.channelId });
+
+  // Use awaitMessages to wait for the user's response
+  try {
+    const collected = await msg.channel.awaitMessages({
+      filter: (m) => m.author.id === msg.author.id,
+      max: 1,
+      time: confirmTimeoutSec * 1000,
+      errors: ['time'],
+    });
+
+    const response = collected.first();
+    pendingConfirms.delete(confirmKey);
+
+    if (response.content.trim().toLowerCase() === 'y' || response.content.trim().toLowerCase() === 'yes') {
+      // Phase 3: Execute the trade
+      await msg.channel.send('⏳ Executing trade...');
+      const execResult = await executeBuy(slug, outcome, amount, maxPrice);
+      const execEmbed = buildTradeEmbed({ slug, market: marketLabel, outcome, amount }, execResult);
+      await msg.channel.send({ embeds: [execEmbed] });
+    } else {
+      await msg.channel.send('❌ Trade cancelled.');
+    }
+  } catch (err) {
+    // Timeout
+    pendingConfirms.delete(confirmKey);
+    await msg.channel.send('⏰ Trade cancelled — confirmation timed out.');
+  }
 }
 
 // --- Message handler ---
 client.on('messageCreate', async (msg) => {
   if (msg.author.bot) return;
   if (msg.channelId !== TRADE_CHANNEL_ID) return;
+
+  // Check if this is a confirmation response for a pending trade
+  const pending = pendingConfirms.get(msg.author.id);
+  if (pending) {
+    // awaitMessages in doBuyWithConfirm handles this — skip normal command parsing
+    return;
+  }
 
   const cmd = parseCommand(msg.content);
   if (!cmd) return;
@@ -530,18 +569,18 @@ client.on('messageCreate', async (msg) => {
       case 'help': {
         await msg.reply({ embeds: [new EmbedBuilder().setColor(0x3498db).setTitle('Bullpen Discord Bot Commands').setDescription([
           '**Natural Language (just paste it, no ! needed):**',
-          '`Buy "Rinderknech" on Polymarket: https://polymarket.com/event/...` — Buy $' + DEFAULT_BUY_AMOUNT + ' (default)',
-          '`Buy "Rinderknech" on Polymarket: https://polymarket.com/event/... for $10` — Buy $10',
-          '`Buy $10 of "Rinderknech" on Polymarket: https://polymarket.com/event/...` — Buy $10',
+          '`Buy "Rinderknech" on Polymarket: https://polymarket.com/event/...` — Preview then confirm to buy $' + DEFAULT_BUY_AMOUNT + ' (default)',
+          '`Buy "Rinderknech" on Polymarket: https://polymarket.com/event/... for $10` — Preview then confirm to buy $10',
+          '`Buy $10 of "Rinderknech" on Polymarket: https://polymarket.com/event/...` — Preview then confirm to buy $10',
           '',
-          '**Buying (previews first, then executes):**',
-          '`!buy "Market Name" YES 10` — Preview then buy $10 of YES',
+          '**Buying (shows preview, type y to confirm):**',
+          '`!buy "Market Name" YES 10` — Preview then confirm to buy $10 of YES',
           '`!buy "Market Name" YES 10 --max-price 0.20` — Buy with max price limit',
           '`!buy "Rinderknech" https://polymarket.com/event/... 10` — Buy by Polymarket URL',
           '`!buy-url https://polymarket.com/event/... YES 10` — Buy by URL (outcome first)',
           '`!buy-slug market-slug YES 10` — Buy by exact slug',
           '',
-          '**Previewing only (no money moves):**',
+          '**Previewing only (no money moves, no confirmation):**',
           '`!preview "Market Name" YES 10` — Preview a buy only',
           '`!preview-slug market-slug YES 10` — Preview by slug',
           '',
@@ -559,6 +598,7 @@ client.on('messageCreate', async (msg) => {
           '`!help` — Show this help',
           '',
           `Default buy amount: $${DEFAULT_BUY_AMOUNT} (set DEFAULT_BUY_AMOUNT in .env)`,
+          `Confirmation timeout: ${confirmTimeoutSec}s (set CONFIRM_TIMEOUT in .env)`,
         ].join('\n'))] });
         break;
       }
@@ -572,6 +612,7 @@ client.on('messageCreate', async (msg) => {
           { name: 'BULLPEN_USE_WSL', value: String(useWsl), inline: true },
           { name: 'BULLPEN_HOME', value: BULLPEN_HOME || '(not set)', inline: true },
           { name: 'DEFAULT_BUY_AMOUNT', value: DEFAULT_BUY_AMOUNT, inline: true },
+          { name: 'CONFIRM_TIMEOUT', value: String(confirmTimeoutSec) + 's', inline: true },
         );
         const verResult = await runBullpen(['--version']);
         if (verResult.ok) {
@@ -626,14 +667,14 @@ client.on('messageCreate', async (msg) => {
           break;
         }
 
-        await msg.reply(`Found ${extracted.type} slug: \`${extracted.slug}\`. Buying **${cmd.outcome}** for $${cmd.amount}${cmd.maxPrice ? ` (max price $${cmd.maxPrice})` : ''}...`);
+        await msg.reply(`Found ${extracted.type} slug: \`${extracted.slug}\`. Previewing buy **${cmd.outcome}** for $${cmd.amount}${cmd.maxPrice ? ` (max price $${cmd.maxPrice})` : ''}...`);
 
         // Try direct slug first
         const previewResult = await previewBuy(extracted.slug, cmd.outcome, cmd.amount, cmd.maxPrice);
 
         if (previewResult.ok) {
-          // Preview worked — do two-phase buy with this slug
-          await doBuyWithPreview(msg, extracted.slug, cmd.outcome, cmd.amount, cmd.maxPrice, extracted.slug);
+          // Preview worked — do interactive confirm flow
+          await doBuyWithConfirm(msg, extracted.slug, cmd.outcome, cmd.amount, cmd.maxPrice, extracted.slug);
         } else {
           // Direct slug preview failed — try searching for the market
           await msg.channel.send('Direct slug failed, searching for specific market...');
@@ -646,18 +687,18 @@ client.on('messageCreate', async (msg) => {
             const slug = matching.slug || matching.market_slug || matching.id;
             const title = matching.title || matching.question || matching.name || slug;
             await msg.channel.send(`Found market: **${title}** (slug: \`${slug}\`)`);
-            await doBuyWithPreview(msg, slug, cmd.outcome, cmd.amount, cmd.maxPrice, title);
+            await doBuyWithConfirm(msg, slug, cmd.outcome, cmd.amount, cmd.maxPrice, title);
           } else {
-            // Search also failed — try executing directly with the original slug as last resort
-            await msg.channel.send('Search failed too. Attempting direct execution...');
-            await doBuyWithPreview(msg, extracted.slug, cmd.outcome, cmd.amount, cmd.maxPrice, extracted.slug);
+            // Search also failed — try previewing directly with the original slug
+            await msg.channel.send('Search failed too. Attempting direct preview...');
+            await doBuyWithConfirm(msg, extracted.slug, cmd.outcome, cmd.amount, cmd.maxPrice, extracted.slug);
           }
         }
         break;
       }
 
       case 'buy-slug': {
-        await doBuyWithPreview(msg, cmd.slug, cmd.outcome, cmd.amount, cmd.maxPrice, cmd.slug);
+        await doBuyWithConfirm(msg, cmd.slug, cmd.outcome, cmd.amount, cmd.maxPrice, cmd.slug);
         break;
       }
 
@@ -677,7 +718,7 @@ client.on('messageCreate', async (msg) => {
         }
         const title = first.title || first.question || first.name || slug;
         await msg.channel.send(`Found: **${title}** (slug: \`${slug}\`)`);
-        await doBuyWithPreview(msg, slug, cmd.outcome, cmd.amount, cmd.maxPrice, title);
+        await doBuyWithConfirm(msg, slug, cmd.outcome, cmd.amount, cmd.maxPrice, title);
         break;
       }
 
@@ -757,6 +798,7 @@ client.once('ready', async () => {
   resolvedBin = await resolveBullpenPath();
   console.log(`Using bullpen binary: ${resolvedBin}`);
   console.log(`Default buy amount: $${DEFAULT_BUY_AMOUNT}`);
+  console.log(`Confirmation timeout: ${confirmTimeoutSec}s`);
 });
 
 client.login(DISCORD_BOT_TOKEN);
