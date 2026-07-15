@@ -39,11 +39,44 @@ function fmtPrice(price) {
   return (Math.round(parseFloat(price) * 100) / 100).toFixed(2);
 }
 
-// --- Round display value to max 2 decimals (shares, potential, spread, etc) ---
+// --- Round display value to max 2 decimals ---
 function fmtDisplay(value, decimals = 2) {
   const n = parseFloat(value);
   if (isNaN(n)) return String(value);
   return parseFloat(n.toFixed(decimals)).toString();
+}
+
+// --- Find nearest amount (2 decimals) where amount/price has ≤ 6 decimals ---
+// Searches bidirectionally (higher and lower) and picks the closest to target
+function findCleanAmount(targetAmount, price) {
+  const p = parseFloat(price);
+  if (!p || p <= 0) return roundAmount(targetAmount);
+
+  const target = roundAmount(targetAmount);
+
+  // Check if target itself is clean
+  const targetShares = target / p;
+  if (Math.abs(targetShares - Math.round(targetShares * 1e6) / 1e6) < 1e-10) {
+    return target;
+  }
+
+  // Search outward in both directions, $0.01 at a time, up to $5.00 away
+  for (let delta = 1; delta <= 500; delta++) {
+    for (const sign of [1, -1]) {
+      const testAmount = Math.round((target + sign * delta * 0.01) * 100) / 100;
+      if (testAmount <= 0) continue;
+      const testShares = testAmount / p;
+      const testSharesRounded = Math.round(testShares * 1e6) / 1e6;
+      if (Math.abs(testShares - testSharesRounded) < 1e-10) {
+        console.log(`Found clean amount: $${testAmount.toFixed(2)} → ${testSharesRounded} shares (target was $${target.toFixed(2)})`);
+        return testAmount;
+      }
+    }
+  }
+
+  // No clean amount found, return original
+  console.log(`No clean amount found near $${target.toFixed(2)} at price ${p}, using original`);
+  return target;
 }
 
 // --- Auto-detect bullpen binary path ---
@@ -499,7 +532,7 @@ function buildEmbedFromSummary(summary) {
   return embed;
 }
 
-// --- Interactive buy: preview, wait for "y", then execute ---
+// --- Interactive buy: preview, wait for "y", then execute with clean amount ---
 async function doBuyWithConfirm(msg, slug, outcome, amount, maxPrice, marketLabel) {
   await msg.channel.sendTyping();
   const previewResult = await previewBuy(slug, outcome, amount, maxPrice);
@@ -511,10 +544,24 @@ async function doBuyWithConfirm(msg, slug, outcome, amount, maxPrice, marketLabe
     return;
   }
 
+  // Extract price from preview to compute clean amount
+  const info = extractTradeInfo(previewResult.stdout);
+  let execAmount = amount;
+  let adjusted = false;
+
+  if (info.price) {
+    const cleanAmt = findCleanAmount(amount, info.price);
+    if (Math.abs(cleanAmt - roundAmount(amount)) > 0.001) {
+      execAmount = cleanAmt;
+      adjusted = true;
+      await msg.channel.send(`⚠️ Adjusting amount from $${fmtAmount(amount)} to $${fmtAmount(execAmount)} for CLOB precision (shares must be ≤ 6 decimals).`);
+    }
+  }
+
   await msg.channel.send(`Type **y** to confirm this trade, or anything else to cancel (${confirmTimeoutSec}s timeout)...`);
 
   const confirmKey = msg.author.id;
-  pendingConfirms.set(confirmKey, { slug, outcome, amount, maxPrice, marketLabel, channelId: msg.channelId });
+  pendingConfirms.set(confirmKey, { slug, outcome, amount: execAmount, maxPrice, marketLabel, channelId: msg.channelId });
 
   try {
     const collected = await msg.channel.awaitMessages({
@@ -529,8 +576,29 @@ async function doBuyWithConfirm(msg, slug, outcome, amount, maxPrice, marketLabe
 
     if (response.content.trim().toLowerCase() === 'y' || response.content.trim().toLowerCase() === 'yes') {
       await msg.channel.send('⏳ Executing trade...');
-      const execResult = await executeBuy(slug, outcome, amount, maxPrice);
-      const execEmbed = buildTradeEmbed({ slug, market: marketLabel, outcome, amount }, execResult);
+
+      // First attempt with clean amount
+      let execResult = await executeBuy(slug, outcome, execAmount, maxPrice);
+
+      // If still fails with decimal error, try without max-price
+      if (!execResult.ok) {
+        const errText = (execResult.stderr || execResult.stdout || '').toLowerCase();
+        if (errText.includes('decimal') || errText.includes('invalid amounts')) {
+          console.log('First attempt failed with decimal error, retrying without --max-price...');
+          execResult = await executeBuy(slug, outcome, execAmount, null);
+        }
+      }
+
+      // If still fails, try with original amount (no clean adjustment)
+      if (!execResult.ok) {
+        const errText = (execResult.stderr || execResult.stdout || '').toLowerCase();
+        if (errText.includes('decimal') || errText.includes('invalid amounts')) {
+          console.log('Still failing, trying original amount without adjustments...');
+          execResult = await executeBuy(slug, outcome, amount, null);
+        }
+      }
+
+      const execEmbed = buildTradeEmbed({ slug, market: marketLabel, outcome, amount: execAmount }, execResult);
       await msg.channel.send({ embeds: [execEmbed] });
     } else {
       await msg.channel.send('❌ Trade cancelled.');
