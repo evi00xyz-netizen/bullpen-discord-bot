@@ -129,19 +129,19 @@ async function searchMarket(query) {
   }
 }
 
-// --- Buy shares ---
-async function buyShares(slug, outcome, amount, maxPrice) {
-  const args = ['trade', 'buy', slug, outcome, String(amount)];
-  if (maxPrice) args.push('--max-price', String(maxPrice));
-  args.push('--yes', '--output', 'json');
-  return runBullpen(args);
-}
-
-// --- Preview buy ---
+// --- Preview buy (no money moves) ---
 async function previewBuy(slug, outcome, amount, maxPrice) {
   const args = ['trade', 'buy', slug, outcome, String(amount)];
   if (maxPrice) args.push('--max-price', String(maxPrice));
   args.push('--preview', '--output', 'json');
+  return runBullpen(args);
+}
+
+// --- Execute buy (real trade) ---
+async function executeBuy(slug, outcome, amount, maxPrice) {
+  const args = ['trade', 'buy', slug, outcome, String(amount)];
+  if (maxPrice) args.push('--max-price', String(maxPrice));
+  args.push('--yes', '--output', 'json');
   return runBullpen(args);
 }
 
@@ -156,74 +156,171 @@ async function sellShares(slug, outcome, maxShares, preview) {
   return runBullpen(args);
 }
 
-// --- Parse JSON output from bullpen and extract key fields ---
+// --- Parse JSON output from bullpen ---
 function parseBullpenResult(stdout) {
   try {
-    const data = JSON.parse(stdout);
-    return data;
+    return JSON.parse(stdout);
   } catch {
     return null;
   }
 }
 
-// --- Format trade result as short human-readable summary ---
-function formatTradeSummary(cmd, result, isPreview) {
-  const data = parseBullpenResult(result.stdout);
+// --- Extract preview info from bullpen output (JSON or text) ---
+function extractPreviewInfo(stdout) {
+  const data = parseBullpenResult(stdout);
+  if (data) {
+    return {
+      price: data.price || data.avg_price || data.fill_price || null,
+      amount: data.amount || data.size || data.cost || data.usdc || null,
+      shares: data.shares || data.fill_amount || data.filled || data.est_shares || data.estimated_shares || null,
+      potential: data.potential || data.potential_payout || data.payout || null,
+      spread: data.spread || null,
+      market: data.market || data.market_slug || data.slug || null,
+      outcome: data.outcome || data.side || null,
+      orderId: data.order_id || data.id || data.tx || null,
+      status: data.status || null,
+      raw: data,
+    };
+  }
+  // Try to parse from text output
+  const text = stdout || '';
+  const priceMatch = text.match(/Price:?\s*\$?([\d.]+)/i);
+  const amountMatch = text.match(/Amount:?\s*\$?([\d.]+)/i);
+  const sharesMatch = text.match(/(?:Est\.?\s*)?shares:?\s*([\d.]+)/i);
+  const potentialMatch = text.match(/Potential:?\s*\$?([\d.]+)/i);
+  const spreadMatch = text.match(/Spread:?\s*\$?([\d.]+)/i);
+  const orderMatch = text.match(/Order submitted successfully.*?ID:?\s*(\S+)/i);
+  const filledMatch = text.match(/Filled:?\s*([\d.]+)\s*@\s*\$?([\d.]+)/i);
+
+  return {
+    price: priceMatch ? priceMatch[1] : (filledMatch ? filledMatch[2] : null),
+    amount: amountMatch ? amountMatch[1] : null,
+    shares: sharesMatch ? sharesMatch[1] : (filledMatch ? filledMatch[1] : null),
+    potential: potentialMatch ? potentialMatch[1] : null,
+    spread: spreadMatch ? spreadMatch[1] : null,
+    market: null,
+    outcome: null,
+    orderId: orderMatch ? orderMatch[1] : null,
+    status: filledMatch ? 'filled' : (orderMatch ? 'submitted' : null),
+    raw: null,
+  };
+}
+
+// --- Format preview embed ---
+function buildPreviewEmbed(cmd, result) {
+  const embed = new EmbedBuilder().setTimestamp();
+  const info = extractPreviewInfo(result.stdout);
 
   if (!result.ok) {
-    // Error — try to extract a short message
     let errMsg = 'Unknown error';
+    const data = parseBullpenResult(result.stdout);
     if (data && data.error) errMsg = data.error;
     else if (data && data.message) errMsg = data.message;
     else {
-      // try to extract first line of stderr/stdout
       const raw = (result.stderr || result.stdout || '').trim();
       const firstLine = raw.split('\n')[0];
       if (firstLine) errMsg = firstLine.slice(0, 200);
     }
-    return { color: 0xff0000, title: '❌ Trade Failed', fields: [
-      { name: 'Error', value: `\`${errMsg}\``, inline: false },
-    ]};
+    embed.setColor(0xff0000).setTitle('❌ Preview Failed');
+    embed.addFields({ name: 'Error', value: `\`${errMsg}\``, inline: false });
+    return embed;
   }
 
-  // Success — extract key fields from JSON
-  const market = data?.market || data?.market_slug || data?.slug || cmd.slug || cmd.market || 'N/A';
-  const outcome = data?.outcome || data?.side || cmd.outcome || 'N/A';
-  const amount = data?.amount || data?.size || data?.cost || data?.usdc || cmd.amount || 'N/A';
-  const shares = data?.shares || data?.fill_amount || data?.filled || data?.amount_bought || 'N/A';
-  const price = data?.price || data?.avg_price || data?.fill_price || data?.execution_price || null;
-  const orderId = data?.order_id || data?.id || data?.tx || data?.tx_hash || null;
-  const status = data?.status || (isPreview ? 'preview' : 'filled');
+  embed.setColor(0x3498db).setTitle('📋 Trade Preview');
 
-  const fields = [];
+  const market = info.market || cmd.slug || cmd.market || 'N/A';
+  const outcome = info.outcome || cmd.outcome || 'N/A';
+  const amount = info.amount || cmd.amount || 'N/A';
 
-  // Market line
-  fields.push({ name: 'Market', value: `\`${String(market).slice(0, 100)}\``, inline: true });
-  // Outcome
-  fields.push({ name: 'Outcome', value: String(outcome), inline: true });
-  // Amount spent
-  fields.push({ name: 'Spent', value: amount !== 'N/A' ? `$${amount}` : 'N/A', inline: true });
+  embed.addFields(
+    { name: 'Market', value: `\`${String(market).slice(0, 100)}\``, inline: true },
+    { name: 'Outcome', value: String(outcome), inline: true },
+    { name: 'Amount', value: amount !== 'N/A' ? `$${amount}` : 'N/A', inline: true },
+  );
 
-  // Shares received
-  if (shares !== 'N/A') {
-    fields.push({ name: 'Shares', value: String(shares), inline: true });
+  if (info.price) embed.addFields({ name: 'Price', value: `${info.price}¢`, inline: true });
+  if (info.shares) embed.addFields({ name: 'Est. Shares', value: String(info.shares), inline: true });
+  if (info.potential) embed.addFields({ name: 'Potential', value: `$${info.potential}`, inline: true });
+  if (info.spread) embed.addFields({ name: 'Spread', value: `${info.spread}¢`, inline: true });
+
+  return embed;
+}
+
+// --- Format trade execution embed ---
+function buildTradeEmbed(cmd, result) {
+  const embed = new EmbedBuilder().setTimestamp();
+  const info = extractPreviewInfo(result.stdout);
+
+  if (!result.ok) {
+    let errMsg = 'Unknown error';
+    const data = parseBullpenResult(result.stdout);
+    if (data && data.error) errMsg = data.error;
+    else if (data && data.message) errMsg = data.message;
+    else {
+      const raw = (result.stderr || result.stdout || '').trim();
+      const firstLine = raw.split('\n')[0];
+      if (firstLine) errMsg = firstLine.slice(0, 200);
+    }
+    embed.setColor(0xff0000).setTitle('❌ Trade Failed');
+    embed.addFields({ name: 'Error', value: `\`${errMsg}\``, inline: false });
+    return embed;
   }
-  // Price
-  if (price !== null) {
-    fields.push({ name: 'Price', value: `$${price}`, inline: true });
+
+  embed.setColor(0x00ff00).setTitle('✅ Trade Executed');
+
+  const market = info.market || cmd.slug || cmd.market || 'N/A';
+  const outcome = info.outcome || cmd.outcome || 'N/A';
+  const amount = info.amount || cmd.amount || 'N/A';
+
+  embed.addFields(
+    { name: 'Market', value: `\`${String(market).slice(0, 100)}\``, inline: true },
+    { name: 'Outcome', value: String(outcome), inline: true },
+    { name: 'Spent', value: amount !== 'N/A' ? `$${amount}` : 'N/A', inline: true },
+  );
+
+  if (info.shares) embed.addFields({ name: 'Shares', value: String(info.shares), inline: true });
+  if (info.price) embed.addFields({ name: 'Fill Price', value: `${info.price}¢`, inline: true });
+  if (info.potential) embed.addFields({ name: 'Potential', value: `$${info.potential}`, inline: true });
+  if (info.orderId) embed.addFields({ name: 'Order ID', value: `\`${String(info.orderId).slice(0, 50)}\``, inline: true });
+
+  return embed;
+}
+
+// --- Format sell embed ---
+function buildSellEmbed(cmd, result, isPreview) {
+  const embed = new EmbedBuilder().setTimestamp();
+  const info = extractPreviewInfo(result.stdout);
+
+  if (!result.ok) {
+    let errMsg = 'Unknown error';
+    const data = parseBullpenResult(result.stdout);
+    if (data && data.error) errMsg = data.error;
+    else {
+      const raw = (result.stderr || result.stdout || '').trim();
+      const firstLine = raw.split('\n')[0];
+      if (firstLine) errMsg = firstLine.slice(0, 200);
+    }
+    embed.setColor(0xff0000).setTitle('❌ Sell Failed');
+    embed.addFields({ name: 'Error', value: `\`${errMsg}\``, inline: false });
+    return embed;
   }
-  // Status
-  fields.push({ name: 'Status', value: isPreview ? '📋 Preview' : '✅ Filled', inline: true });
 
-  // Order ID (if present, short)
-  if (orderId) {
-    fields.push({ name: 'Order ID', value: `\`${String(orderId).slice(0, 50)}\``, inline: true });
-  }
+  embed.setColor(isPreview ? 0x3498db : 0x00ff00).setTitle(isPreview ? '📋 Sell Preview' : '✅ Sell Executed');
 
-  const color = isPreview ? 0x3498db : 0x00ff00;
-  const title = isPreview ? '📋 Trade Preview' : '✅ Trade Executed';
+  const market = info.market || cmd.slug || cmd.market || 'N/A';
+  const outcome = info.outcome || cmd.outcome || 'N/A';
 
-  return { color, title, fields };
+  embed.addFields(
+    { name: 'Market', value: `\`${String(market).slice(0, 100)}\``, inline: true },
+    { name: 'Outcome', value: String(outcome), inline: true },
+    { name: 'Status', value: isPreview ? 'Preview' : 'Filled', inline: true },
+  );
+
+  if (info.shares) embed.addFields({ name: 'Shares', value: String(info.shares), inline: true });
+  if (info.price) embed.addFields({ name: 'Price', value: `${info.price}¢`, inline: true });
+  if (info.amount) embed.addFields({ name: 'Received', value: `$${info.amount}`, inline: true });
+
+  return embed;
 }
 
 // --- Format status as short summary ---
@@ -258,7 +355,6 @@ function formatStatusSummary(result) {
     fields.push({ name: 'Network', value: String(data.network || data.chain), inline: true });
   }
 
-  // If we couldn't parse structured data, show a short text snippet
   if (fields.length <= 1) {
     const short = result.stdout.trim().split('\n').slice(0, 3).join('\n').slice(0, 300);
     fields.push({ name: 'Details', value: `\`\`\`${short}\`\`\``, inline: false });
@@ -284,7 +380,6 @@ function formatPositionsSummary(result) {
     ]};
   }
 
-  // Try to extract positions array
   const positions = data?.positions || data?.markets || (Array.isArray(data) ? data : null);
 
   if (!positions || positions.length === 0) {
@@ -396,6 +491,30 @@ function buildEmbedFromSummary(summary) {
   return embed;
 }
 
+// --- Two-phase buy: preview first, then execute ---
+// Shows preview embed, waits 3 seconds, then executes and shows result embed
+async function doBuyWithPreview(msg, slug, outcome, amount, maxPrice, marketLabel) {
+  // Phase 1: Preview
+  await msg.channel.sendTyping();
+  const previewResult = await previewBuy(slug, outcome, amount, maxPrice);
+
+  if (!previewResult.ok) {
+    const embed = buildPreviewEmbed({ slug, market: marketLabel, outcome, amount }, previewResult);
+    await msg.channel.send({ embeds: [embed] });
+    return;
+  }
+
+  // Show preview embed
+  const previewEmbed = buildPreviewEmbed({ slug, market: marketLabel, outcome, amount }, previewResult);
+  await msg.channel.send({ embeds: [previewEmbed] });
+
+  // Phase 2: Execute
+  await msg.channel.send('⏳ Executing trade...');
+  const execResult = await executeBuy(slug, outcome, amount, maxPrice);
+  const execEmbed = buildTradeEmbed({ slug, market: marketLabel, outcome, amount }, execResult);
+  await msg.channel.send({ embeds: [execEmbed] });
+}
+
 // --- Message handler ---
 client.on('messageCreate', async (msg) => {
   if (msg.author.bot) return;
@@ -415,15 +534,15 @@ client.on('messageCreate', async (msg) => {
           '`Buy "Rinderknech" on Polymarket: https://polymarket.com/event/... for $10` — Buy $10',
           '`Buy $10 of "Rinderknech" on Polymarket: https://polymarket.com/event/...` — Buy $10',
           '',
-          '**Buying:**',
-          '`!buy "Market Name" YES 10` — Buy $10 of YES (auto-searches)',
+          '**Buying (always previews first, then executes):**',
+          '`!buy "Market Name" YES 10` — Preview then buy $10 of YES',
           '`!buy "Market Name" YES 10 --max-price 0.20` — Buy with max price limit',
           '`!buy "Rinderknech" https://polymarket.com/event/... 10` — Buy by Polymarket URL',
           '`!buy-url https://polymarket.com/event/... YES 10` — Buy by URL (outcome first)',
           '`!buy-slug market-slug YES 10` — Buy by exact slug',
           '',
-          '**Previewing (no money moves):**',
-          '`!preview "Market Name" YES 10` — Preview a buy',
+          '**Previewing only (no money moves):**',
+          '`!preview "Market Name" YES 10` — Preview a buy only',
           '`!preview-slug market-slug YES 10` — Preview by slug',
           '',
           '**Selling:**',
@@ -507,14 +626,16 @@ client.on('messageCreate', async (msg) => {
           break;
         }
 
-        await msg.reply(`Found ${extracted.type} slug: \`${extracted.slug}\`. Buying **${cmd.outcome}** for $${cmd.amount}${cmd.maxPrice ? ` (max price $${cmd.maxPrice})` : ''}...`);
+        await msg.reply(`Found ${extracted.type} slug: \`${extracted.slug}\`. Previewing buy **${cmd.outcome}** for $${cmd.amount}${cmd.maxPrice ? ` (max price $${cmd.maxPrice})` : ''}...`);
 
-        const buyResult = await buyShares(extracted.slug, cmd.outcome, cmd.amount, cmd.maxPrice);
-        if (buyResult.ok) {
-          const summary = formatTradeSummary({ ...cmd, slug: extracted.slug }, buyResult);
-          await msg.channel.send({ embeds: [buildEmbedFromSummary(summary)] });
+        // Try direct slug first
+        const previewResult = await previewBuy(extracted.slug, cmd.outcome, cmd.amount, cmd.maxPrice);
+
+        if (previewResult.ok) {
+          // Preview looks good — do two-phase buy
+          await doBuyWithPreview(msg, extracted.slug, cmd.outcome, cmd.amount, cmd.maxPrice, extracted.slug);
         } else {
-          // If direct slug fails, try searching for the market
+          // Direct slug failed — try searching
           await msg.channel.send('Direct slug failed, searching for specific market...');
           const searchResult = await searchMarket(extracted.slug);
           if (searchResult.ok && searchResult.markets.length > 0) {
@@ -524,10 +645,8 @@ client.on('messageCreate', async (msg) => {
             }) || searchResult.markets[0];
             const slug = matching.slug || matching.market_slug || matching.id;
             const title = matching.title || matching.question || matching.name || slug;
-            await msg.channel.send(`Found market: **${title}** (slug: \`${slug}\`). Executing buy ${cmd.outcome} for $${cmd.amount}...`);
-            const retryResult = await buyShares(slug, cmd.outcome, cmd.amount, cmd.maxPrice);
-            const summary = formatTradeSummary({ ...cmd, slug }, retryResult);
-            await msg.channel.send({ embeds: [buildEmbedFromSummary(summary)] });
+            await msg.channel.send(`Found market: **${title}** (slug: \`${slug}\`)`);
+            await doBuyWithPreview(msg, slug, cmd.outcome, cmd.amount, cmd.maxPrice, title);
           } else {
             await msg.channel.send({ embeds: [new EmbedBuilder().setColor(0xff0000).setTimestamp().setTitle('Market Not Found').setDescription(`Could not find a market for \`${extracted.slug}\`. Try \`!buy-slug ${extracted.slug} ${cmd.outcome} ${cmd.amount}\` manually.`)] });
           }
@@ -536,11 +655,7 @@ client.on('messageCreate', async (msg) => {
       }
 
       case 'buy-slug': {
-        await msg.channel.sendTyping();
-        await msg.reply(`Executing: buy ${cmd.outcome} on \`${cmd.slug}\` for $${cmd.amount}${cmd.maxPrice ? ` (max price $${cmd.maxPrice})` : ''}...`);
-        const result = await buyShares(cmd.slug, cmd.outcome, cmd.amount, cmd.maxPrice);
-        const summary = formatTradeSummary({ ...cmd, market: cmd.slug }, result);
-        await msg.channel.send({ embeds: [buildEmbedFromSummary(summary)] });
+        await doBuyWithPreview(msg, cmd.slug, cmd.outcome, cmd.amount, cmd.maxPrice, cmd.slug);
         break;
       }
 
@@ -559,10 +674,8 @@ client.on('messageCreate', async (msg) => {
           break;
         }
         const title = first.title || first.question || first.name || slug;
-        await msg.channel.send(`Found: **${title}** (slug: \`${slug}\`). Executing buy ${cmd.outcome} for $${cmd.amount}${cmd.maxPrice ? ` (max price $${cmd.maxPrice})` : ''}...`);
-        const buyResult = await buyShares(slug, cmd.outcome, cmd.amount, cmd.maxPrice);
-        const summary = formatTradeSummary({ ...cmd, slug }, buyResult);
-        await msg.channel.send({ embeds: [buildEmbedFromSummary(summary)] });
+        await msg.channel.send(`Found: **${title}** (slug: \`${slug}\`)`);
+        await doBuyWithPreview(msg, slug, cmd.outcome, cmd.amount, cmd.maxPrice, title);
         break;
       }
 
@@ -570,8 +683,8 @@ client.on('messageCreate', async (msg) => {
         await msg.channel.sendTyping();
         await msg.reply(`Previewing: buy ${cmd.outcome} on \`${cmd.slug}\` for $${cmd.amount}${cmd.maxPrice ? ` (max price $${cmd.maxPrice})` : ''}...`);
         const result = await previewBuy(cmd.slug, cmd.outcome, cmd.amount, cmd.maxPrice);
-        const summary = formatTradeSummary({ ...cmd, market: cmd.slug }, result, true);
-        await msg.channel.send({ embeds: [buildEmbedFromSummary(summary)] });
+        const embed = buildPreviewEmbed({ ...cmd, market: cmd.slug }, result);
+        await msg.channel.send({ embeds: [embed] });
         break;
       }
 
@@ -591,9 +704,9 @@ client.on('messageCreate', async (msg) => {
         }
         const title = first.title || first.question || first.name || slug;
         await msg.channel.send(`Found: **${title}** (slug: \`${slug}\`). Previewing buy ${cmd.outcome} for $${cmd.amount}...`);
-        const previewResult = await previewBuy(slug, cmd.outcome, cmd.amount, cmd.maxPrice);
-        const summary = formatTradeSummary({ ...cmd, slug }, previewResult, true);
-        await msg.channel.send({ embeds: [buildEmbedFromSummary(summary)] });
+        const result = await previewBuy(slug, cmd.outcome, cmd.amount, cmd.maxPrice);
+        const embed = buildPreviewEmbed({ ...cmd, slug, market: title }, result);
+        await msg.channel.send({ embeds: [embed] });
         break;
       }
 
@@ -602,8 +715,8 @@ client.on('messageCreate', async (msg) => {
         const sellStr = cmd.sellAmount === 'max' ? 'all' : `${cmd.sellAmount} shares`;
         await msg.reply(`Executing: sell ${sellStr} of ${cmd.outcome} on \`${cmd.slug}\`${cmd.preview ? ' (preview)' : ''}...`);
         const result = await sellShares(cmd.slug, cmd.outcome, cmd.sellAmount, cmd.preview);
-        const summary = formatTradeSummary({ ...cmd, market: cmd.slug, outcome: cmd.outcome, amount: cmd.sellAmount }, result, cmd.preview);
-        await msg.channel.send({ embeds: [buildEmbedFromSummary(summary)] });
+        const embed = buildSellEmbed({ ...cmd, market: cmd.slug, outcome: cmd.outcome, amount: cmd.sellAmount }, result, cmd.preview);
+        await msg.channel.send({ embeds: [embed] });
         break;
       }
 
@@ -625,8 +738,8 @@ client.on('messageCreate', async (msg) => {
         const sellStr = cmd.sellAmount === 'max' ? 'all' : `${cmd.sellAmount} shares`;
         await msg.channel.send(`Found: **${title}** (slug: \`${slug}\`). Selling ${sellStr} of ${cmd.outcome}${cmd.preview ? ' (preview)' : ''}...`);
         const sellResult = await sellShares(slug, cmd.outcome, cmd.sellAmount, cmd.preview);
-        const summary = formatTradeSummary({ ...cmd, slug, market: cmd.market, outcome: cmd.outcome, amount: cmd.sellAmount }, sellResult, cmd.preview);
-        await msg.channel.send({ embeds: [buildEmbedFromSummary(summary)] });
+        const embed = buildSellEmbed({ ...cmd, slug, market: title, outcome: cmd.outcome, amount: cmd.sellAmount }, sellResult, cmd.preview);
+        await msg.channel.send({ embeds: [embed] });
         break;
       }
     }
