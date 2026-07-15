@@ -1,9 +1,10 @@
 import { Client, GatewayIntentBits, EmbedBuilder } from 'discord.js';
 import { config } from 'dotenv';
-import { execFile } from 'child_process';
+import { execFile, exec } from 'child_process';
 import { promisify } from 'util';
 
 const execFileAsync = promisify(execFile);
+const execAsync = promisify(exec);
 config();
 
 const {
@@ -20,6 +21,48 @@ if (!TRADE_CHANNEL_ID) { console.error('Missing TRADE_CHANNEL_ID'); process.exit
 
 const useWsl = BULLPEN_USE_WSL.toLowerCase() === 'true';
 
+// --- Auto-detect bullpen binary path ---
+let resolvedBin = BULLPEN_BIN;
+async function resolveBullpenPath() {
+  // Try the configured bin first
+  try {
+    await execFileAsync(BULLPEN_BIN, ['--version'], { timeout: 5000 });
+    console.log(`Bullpen found: ${BULLPEN_BIN}`);
+    return BULLPEN_BIN;
+  } catch {}
+
+  // Try common install locations
+  const commonPaths = [
+    '/usr/local/bin/bullpen',
+    '/usr/bin/bullpen',
+    `${process.env.HOME}/.local/bin/bullpen`,
+    `${process.env.HOME}/.bullpen/bin/bullpen`,
+    `${process.env.HOME}/bin/bullpen`,
+  ];
+
+  for (const p of commonPaths) {
+    try {
+      await execFileAsync(p, ['--version'], { timeout: 5000 });
+      console.log(`Bullpen found at: ${p}`);
+      return p;
+    } catch {}
+  }
+
+  // Try `which bullpen` via shell
+  try {
+    const { stdout } = await execAsync('which bullpen 2>/dev/null || command -v bullpen 2>/dev/null', { timeout: 5000 });
+    const path = stdout.trim();
+    if (path) {
+      console.log(`Bullpen found via which: ${path}`);
+      return path;
+    }
+  } catch {}
+
+  console.error('WARNING: Could not find bullpen binary. Tried:', BULLPEN_BIN, ...commonPaths);
+  console.error('Set BULLPEN_BIN in .env to the full path of your bullpen install');
+  return BULLPEN_BIN;
+}
+
 const client = new Client({
   intents: [
     GatewayIntentBits.Guilds,
@@ -29,20 +72,27 @@ const client = new Client({
 });
 
 // --- Bullpen CLI helper ---
-// On Windows with WSL2, bullpen is installed inside Ubuntu.
-// We call `wsl -e bullpen <args>` instead of `bullpen <args>` directly.
 async function runBullpen(args) {
   const env = { ...process.env };
   if (BULLPEN_HOME) env.BULLPEN_HOME = BULLPEN_HOME;
   if (BULLPEN_ENV) env.BULLPEN_ENV = BULLPEN_ENV;
   env.BULLPEN_NON_INTERACTIVE = '1';
 
+  // Make sure common bin dirs are in PATH
+  const extraPaths = [
+    '/usr/local/bin',
+    '/usr/bin',
+    `${process.env.HOME}/.local/bin`,
+    `${process.env.HOME}/.bullpen/bin`,
+  ];
+  env.PATH = `${extraPaths.join(':')}:${env.PATH || ''}`;
+
   let bin, binArgs;
   if (useWsl) {
     bin = 'wsl';
-    binArgs = ['-e', BULLPEN_BIN, ...args];
+    binArgs = ['-e', resolvedBin, ...args];
   } else {
-    bin = BULLPEN_BIN;
+    bin = resolvedBin;
     binArgs = args;
   }
 
@@ -52,7 +102,9 @@ async function runBullpen(args) {
     });
     return { ok: true, stdout };
   } catch (err) {
-    return { ok: false, stdout: err.stdout || '', stderr: err.stderr || err.message };
+    // err.message is usually "Command failed: ..." — get the real error
+    const realError = err.stderr || err.stdout || err.message;
+    return { ok: false, stdout: err.stdout || '', stderr: realError };
   }
 }
 
@@ -102,6 +154,7 @@ function parseCommand(content) {
 
   if (/^!status$/i.test(t)) return { type: 'status' };
   if (/^!positions$/i.test(t)) return { type: 'positions' };
+  if (/^!debug$/i.test(t)) return { type: 'debug' };
   if (/^!help$/i.test(t)) return { type: 'help' };
 
   return null;
@@ -151,8 +204,30 @@ client.on('messageCreate', async (msg) => {
           '`!search Trump election` — Search Polymarket markets',
           '`!status` — Check Bullpen CLI status',
           '`!positions` — View your Polymarket positions',
+          '`!debug` — Show bot debug info (bullpen path, env, etc.)',
           '`!help` — Show this help',
         ].join('\n'))] });
+        break;
+      }
+
+      case 'debug': {
+        await msg.channel.sendTyping();
+        const embed = new EmbedBuilder().setTimestamp().setColor(0x3498db).setTitle('Debug Info');
+        embed.addFields(
+          { name: 'BULLPEN_BIN', value: BULLPEN_BIN, inline: true },
+          { name: 'resolvedBin', value: resolvedBin, inline: true },
+          { name: 'BULLPEN_USE_WSL', value: String(useWsl), inline: true },
+          { name: 'BULLPEN_HOME', value: BULLPEN_HOME || '(not set)', inline: true },
+          { name: 'PATH', value: '```' + (process.env.PATH || '').slice(0, 500) + '```' },
+        );
+        // Try running bullpen --version
+        const verResult = await runBullpen(['--version']);
+        if (verResult.ok) {
+          embed.addFields({ name: 'bullpen --version', value: '```' + verResult.stdout.slice(0, 200) + '```' });
+        } else {
+          embed.addFields({ name: 'bullpen --version', value: '```' + (verResult.stderr || verResult.stdout || 'failed').slice(0, 200) + '```' });
+        }
+        await msg.reply({ embeds: [embed] });
         break;
       }
 
@@ -236,9 +311,12 @@ client.on('messageCreate', async (msg) => {
   }
 });
 
-client.once('ready', () => {
+client.once('ready', async () => {
   console.log(`Bullpen Discord bot online — listening in channel ${TRADE_CHANNEL_ID}`);
   if (useWsl) console.log('WSL2 mode: bullpen commands routed through `wsl -e bullpen`');
+  // Resolve bullpen path on startup
+  resolvedBin = await resolveBullpenPath();
+  console.log(`Using bullpen binary: ${resolvedBin}`);
 });
 
 client.login(DISCORD_BOT_TOKEN);
