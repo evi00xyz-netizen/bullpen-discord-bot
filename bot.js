@@ -14,7 +14,7 @@ const {
   BULLPEN_HOME,
   BULLPEN_ENV = 'production',
   BULLPEN_USE_WSL = 'false',
-  DEFAULT_BUY_AMOUNT = '5',
+  DEFAULT_BUY_AMOUNT = '2',
 } = process.env;
 
 if (!DISCORD_BOT_TOKEN) { console.error('Missing DISCORD_BOT_TOKEN'); process.exit(1); }
@@ -156,15 +156,171 @@ async function sellShares(slug, outcome, maxShares, preview) {
   return runBullpen(args);
 }
 
+// --- Parse JSON output from bullpen and extract key fields ---
+function parseBullpenResult(stdout) {
+  try {
+    const data = JSON.parse(stdout);
+    return data;
+  } catch {
+    return null;
+  }
+}
+
+// --- Format trade result as short human-readable summary ---
+function formatTradeSummary(cmd, result, isPreview) {
+  const data = parseBullpenResult(result.stdout);
+
+  if (!result.ok) {
+    // Error — try to extract a short message
+    let errMsg = 'Unknown error';
+    if (data && data.error) errMsg = data.error;
+    else if (data && data.message) errMsg = data.message;
+    else {
+      // try to extract first line of stderr/stdout
+      const raw = (result.stderr || result.stdout || '').trim();
+      const firstLine = raw.split('\n')[0];
+      if (firstLine) errMsg = firstLine.slice(0, 200);
+    }
+    return { color: 0xff0000, title: '❌ Trade Failed', fields: [
+      { name: 'Error', value: `\`${errMsg}\``, inline: false },
+    ]};
+  }
+
+  // Success — extract key fields from JSON
+  const market = data?.market || data?.market_slug || data?.slug || cmd.slug || cmd.market || 'N/A';
+  const outcome = data?.outcome || data?.side || cmd.outcome || 'N/A';
+  const amount = data?.amount || data?.size || data?.cost || data?.usdc || cmd.amount || 'N/A';
+  const shares = data?.shares || data?.fill_amount || data?.filled || data?.amount_bought || 'N/A';
+  const price = data?.price || data?.avg_price || data?.fill_price || data?.execution_price || null;
+  const orderId = data?.order_id || data?.id || data?.tx || data?.tx_hash || null;
+  const status = data?.status || (isPreview ? 'preview' : 'filled');
+
+  const fields = [];
+
+  // Market line
+  fields.push({ name: 'Market', value: `\`${String(market).slice(0, 100)}\``, inline: true });
+  // Outcome
+  fields.push({ name: 'Outcome', value: String(outcome), inline: true });
+  // Amount spent
+  fields.push({ name: 'Spent', value: amount !== 'N/A' ? `$${amount}` : 'N/A', inline: true });
+
+  // Shares received
+  if (shares !== 'N/A') {
+    fields.push({ name: 'Shares', value: String(shares), inline: true });
+  }
+  // Price
+  if (price !== null) {
+    fields.push({ name: 'Price', value: `$${price}`, inline: true });
+  }
+  // Status
+  fields.push({ name: 'Status', value: isPreview ? '📋 Preview' : '✅ Filled', inline: true });
+
+  // Order ID (if present, short)
+  if (orderId) {
+    fields.push({ name: 'Order ID', value: `\`${String(orderId).slice(0, 50)}\``, inline: true });
+  }
+
+  const color = isPreview ? 0x3498db : 0x00ff00;
+  const title = isPreview ? '📋 Trade Preview' : '✅ Trade Executed';
+
+  return { color, title, fields };
+}
+
+// --- Format status as short summary ---
+function formatStatusSummary(result) {
+  const data = parseBullpenResult(result.stdout);
+
+  if (!result.ok) {
+    let errMsg = 'Unknown error';
+    if (data && data.error) errMsg = data.error;
+    else {
+      const raw = (result.stderr || result.stdout || '').trim();
+      const firstLine = raw.split('\n')[0];
+      if (firstLine) errMsg = firstLine.slice(0, 200);
+    }
+    return { color: 0xff0000, title: '❌ Status Error', fields: [
+      { name: 'Error', value: `\`${errMsg}\``, inline: false },
+    ]};
+  }
+
+  const fields = [];
+  const loggedIn = data?.logged_in ?? data?.authenticated ?? data?.status === 'ok';
+  fields.push({ name: 'Logged In', value: loggedIn ? '✅ Yes' : '❌ No', inline: true });
+
+  if (data?.wallet || data?.address) {
+    fields.push({ name: 'Wallet', value: `\`${String(data.wallet || data.address).slice(0, 42)}\``, inline: true });
+  }
+  if (data?.balance !== undefined || data?.usdc_balance !== undefined) {
+    const bal = data?.balance ?? data?.usdc_balance ?? 'N/A';
+    fields.push({ name: 'USDC Balance', value: `$${bal}`, inline: true });
+  }
+  if (data?.network || data?.chain) {
+    fields.push({ name: 'Network', value: String(data.network || data.chain), inline: true });
+  }
+
+  // If we couldn't parse structured data, show a short text snippet
+  if (fields.length <= 1) {
+    const short = result.stdout.trim().split('\n').slice(0, 3).join('\n').slice(0, 300);
+    fields.push({ name: 'Details', value: `\`\`\`${short}\`\`\``, inline: false });
+  }
+
+  return { color: 0x00ff00, title: '📊 Bullpen Status', fields };
+}
+
+// --- Format positions as short summary ---
+function formatPositionsSummary(result) {
+  const data = parseBullpenResult(result.stdout);
+
+  if (!result.ok) {
+    let errMsg = 'Unknown error';
+    if (data && data.error) errMsg = data.error;
+    else {
+      const raw = (result.stderr || result.stdout || '').trim();
+      const firstLine = raw.split('\n')[0];
+      if (firstLine) errMsg = firstLine.slice(0, 200);
+    }
+    return { color: 0xff0000, title: '❌ Positions Error', fields: [
+      { name: 'Error', value: `\`${errMsg}\``, inline: false },
+    ]};
+  }
+
+  // Try to extract positions array
+  const positions = data?.positions || data?.markets || (Array.isArray(data) ? data : null);
+
+  if (!positions || positions.length === 0) {
+    return { color: 0x3498db, title: '📊 Positions', fields: [
+      { name: 'Result', value: 'No open positions', inline: false },
+    ]};
+  }
+
+  const fields = [];
+  positions.slice(0, 5).forEach((p, i) => {
+    const market = p?.market || p?.market_slug || p?.question || p?.title || `Position ${i + 1}`;
+    const outcome = p?.outcome || p?.side || 'N/A';
+    const shares = p?.shares || p?.size || p?.amount || 'N/A';
+    const value = p?.value || p?.current_value || p?.cost || 'N/A';
+    const pnl = p?.pnl || p?.profit || p?.realized_pnl || null;
+
+    let line = `**${market}**\n${outcome} | ${shares} shares`;
+    if (value !== 'N/A') line += ` | $${value}`;
+    if (pnl !== null) line += ` | PnL: $${pnl}`;
+
+    fields.push({ name: `#${i + 1}`, value: line.slice(0, 200), inline: false });
+  });
+
+  if (positions.length > 5) {
+    fields.push({ name: 'More', value: `...and ${positions.length - 5} more positions`, inline: false });
+  }
+
+  return { color: 0x00ff00, title: `📊 Positions (${positions.length})`, fields };
+}
+
 // --- Parse commands ---
-// IMPORTANT: natural language patterns work WITHOUT the ! prefix
-// ! commands are checked first, then natural language patterns
 function parseCommand(content) {
   const t = content.trim();
 
   // ==========================================
   // NATURAL LANGUAGE (no ! prefix needed)
-  // These are checked FIRST so plain text works
   // ==========================================
 
   // Buy "Rinderknech" on Polymarket: https://polymarket.com/event/... for $10
@@ -204,14 +360,6 @@ function parseCommand(content) {
   m = t.match(/^!buy-slug\s+(\S+)\s+(\w+)\s+([\d.]+)(?:\s+--max-price\s+([\d.]+))?$/i);
   if (m) return { type: 'buy-slug', slug: m[1], outcome: m[2].toUpperCase(), amount: parseFloat(m[3]), maxPrice: m[4] ? parseFloat(m[4]) : null };
 
-  // !trade buy $10 of YES on "Market Name"
-  m = t.match(/^!trade\s+buy\s+\$([\d.]+)\s+of\s+(\w+)\s+on\s+"([^"]+)"$/i);
-  if (m) return { type: 'buy', market: m[3], outcome: m[2].toUpperCase(), amount: parseFloat(m[1]) };
-
-  // !trade buy $10 of YES on Market Name
-  m = t.match(/^!trade\s+buy\s+\$([\d.]+)\s+of\s+(\w+)\s+on\s+(.+)$/i);
-  if (m) return { type: 'buy', market: m[3].trim(), outcome: m[2].toUpperCase(), amount: parseFloat(m[1]) };
-
   // !preview "Market Name" YES 10 [--max-price 0.20]
   m = t.match(/^!preview\s+"([^"]+)"\s+(\w+)\s+([\d.]+)(?:\s+--max-price\s+([\d.]+))?$/i);
   if (m) return { type: 'preview', market: m[1], outcome: m[2].toUpperCase(), amount: parseFloat(m[3]), maxPrice: m[4] ? parseFloat(m[4]) : null };
@@ -240,29 +388,11 @@ function parseCommand(content) {
   return null;
 }
 
-// --- Trade result embed ---
-function buildTradeEmbed(cmd, result, isPreview) {
+// --- Build embed from summary ---
+function buildEmbedFromSummary(summary) {
   const embed = new EmbedBuilder().setTimestamp();
-  const title = isPreview ? 'Trade Preview' : (result.ok ? 'Trade Executed' : 'Trade Failed');
-  const color = result.ok ? (isPreview ? 0x3498db : 0x00ff00) : 0xff0000;
-  embed.setColor(color).setTitle(title);
-
-  let info = '';
-  if (result.ok) {
-    try {
-      const data = JSON.parse(result.stdout);
-      info = JSON.stringify(data, null, 2);
-    } catch { info = result.stdout.slice(0, 1000); }
-  } else {
-    info = result.stderr || result.stdout || 'Unknown error';
-  }
-
-  embed.addFields(
-    { name: 'Market', value: cmd.slug || cmd.market || 'N/A', inline: true },
-    { name: 'Outcome', value: cmd.outcome, inline: true },
-    { name: 'Amount', value: cmd.amount ? `$${cmd.amount}` : (cmd.sellAmount || 'max'), inline: true },
-    { name: isPreview ? 'Preview' : 'Result', value: '```' + info.slice(0, 1000) + '```' },
-  );
+  embed.setColor(summary.color).setTitle(summary.title);
+  embed.addFields(...summary.fields);
   return embed;
 }
 
@@ -274,7 +404,6 @@ client.on('messageCreate', async (msg) => {
   const cmd = parseCommand(msg.content);
   if (!cmd) return;
 
-  // Log what was parsed for debugging
   console.log(`Parsed command: ${JSON.stringify(cmd)}`);
 
   try {
@@ -324,7 +453,6 @@ client.on('messageCreate', async (msg) => {
           { name: 'BULLPEN_USE_WSL', value: String(useWsl), inline: true },
           { name: 'BULLPEN_HOME', value: BULLPEN_HOME || '(not set)', inline: true },
           { name: 'DEFAULT_BUY_AMOUNT', value: DEFAULT_BUY_AMOUNT, inline: true },
-          { name: 'PATH', value: '```' + (process.env.PATH || '').slice(0, 500) + '```' },
         );
         const verResult = await runBullpen(['--version']);
         if (verResult.ok) {
@@ -339,26 +467,16 @@ client.on('messageCreate', async (msg) => {
       case 'status': {
         await msg.channel.sendTyping();
         const result = await runBullpen(['status', '--output', 'json']);
-        const embed = new EmbedBuilder().setTimestamp();
-        if (result.ok) {
-          embed.setColor(0x00ff00).setTitle('Bullpen Status').setDescription('```' + result.stdout.slice(0, 1500) + '```');
-        } else {
-          embed.setColor(0xff0000).setTitle('Bullpen Status Error').setDescription('```' + (result.stderr || result.stdout).slice(0, 1500) + '```');
-        }
-        await msg.reply({ embeds: [embed] });
+        const summary = formatStatusSummary(result);
+        await msg.reply({ embeds: [buildEmbedFromSummary(summary)] });
         break;
       }
 
       case 'positions': {
         await msg.channel.sendTyping();
         const result = await runBullpen(['polymarket', 'positions', '--output', 'json']);
-        const embed = new EmbedBuilder().setTimestamp();
-        if (result.ok) {
-          embed.setColor(0x00ff00).setTitle('Polymarket Positions').setDescription('```' + result.stdout.slice(0, 1500) + '```');
-        } else {
-          embed.setColor(0xff0000).setTitle('Positions Error').setDescription('```' + (result.stderr || result.stdout).slice(0, 1500) + '```');
-        }
-        await msg.reply({ embeds: [embed] });
+        const summary = formatPositionsSummary(result);
+        await msg.reply({ embeds: [buildEmbedFromSummary(summary)] });
         break;
       }
 
@@ -391,10 +509,10 @@ client.on('messageCreate', async (msg) => {
 
         await msg.reply(`Found ${extracted.type} slug: \`${extracted.slug}\`. Buying **${cmd.outcome}** for $${cmd.amount}${cmd.maxPrice ? ` (max price $${cmd.maxPrice})` : ''}...`);
 
-        // Try using the slug directly with bullpen trade buy
         const buyResult = await buyShares(extracted.slug, cmd.outcome, cmd.amount, cmd.maxPrice);
         if (buyResult.ok) {
-          await msg.channel.send({ embeds: [buildTradeEmbed({ ...cmd, slug: extracted.slug }, buyResult)] });
+          const summary = formatTradeSummary({ ...cmd, slug: extracted.slug }, buyResult);
+          await msg.channel.send({ embeds: [buildEmbedFromSummary(summary)] });
         } else {
           // If direct slug fails, try searching for the market
           await msg.channel.send('Direct slug failed, searching for specific market...');
@@ -408,7 +526,8 @@ client.on('messageCreate', async (msg) => {
             const title = matching.title || matching.question || matching.name || slug;
             await msg.channel.send(`Found market: **${title}** (slug: \`${slug}\`). Executing buy ${cmd.outcome} for $${cmd.amount}...`);
             const retryResult = await buyShares(slug, cmd.outcome, cmd.amount, cmd.maxPrice);
-            await msg.channel.send({ embeds: [buildTradeEmbed({ ...cmd, slug }, retryResult)] });
+            const summary = formatTradeSummary({ ...cmd, slug }, retryResult);
+            await msg.channel.send({ embeds: [buildEmbedFromSummary(summary)] });
           } else {
             await msg.channel.send({ embeds: [new EmbedBuilder().setColor(0xff0000).setTimestamp().setTitle('Market Not Found').setDescription(`Could not find a market for \`${extracted.slug}\`. Try \`!buy-slug ${extracted.slug} ${cmd.outcome} ${cmd.amount}\` manually.`)] });
           }
@@ -420,7 +539,8 @@ client.on('messageCreate', async (msg) => {
         await msg.channel.sendTyping();
         await msg.reply(`Executing: buy ${cmd.outcome} on \`${cmd.slug}\` for $${cmd.amount}${cmd.maxPrice ? ` (max price $${cmd.maxPrice})` : ''}...`);
         const result = await buyShares(cmd.slug, cmd.outcome, cmd.amount, cmd.maxPrice);
-        await msg.channel.send({ embeds: [buildTradeEmbed({ ...cmd, market: cmd.slug }, result)] });
+        const summary = formatTradeSummary({ ...cmd, market: cmd.slug }, result);
+        await msg.channel.send({ embeds: [buildEmbedFromSummary(summary)] });
         break;
       }
 
@@ -441,7 +561,8 @@ client.on('messageCreate', async (msg) => {
         const title = first.title || first.question || first.name || slug;
         await msg.channel.send(`Found: **${title}** (slug: \`${slug}\`). Executing buy ${cmd.outcome} for $${cmd.amount}${cmd.maxPrice ? ` (max price $${cmd.maxPrice})` : ''}...`);
         const buyResult = await buyShares(slug, cmd.outcome, cmd.amount, cmd.maxPrice);
-        await msg.channel.send({ embeds: [buildTradeEmbed({ ...cmd, slug }, buyResult)] });
+        const summary = formatTradeSummary({ ...cmd, slug }, buyResult);
+        await msg.channel.send({ embeds: [buildEmbedFromSummary(summary)] });
         break;
       }
 
@@ -449,7 +570,8 @@ client.on('messageCreate', async (msg) => {
         await msg.channel.sendTyping();
         await msg.reply(`Previewing: buy ${cmd.outcome} on \`${cmd.slug}\` for $${cmd.amount}${cmd.maxPrice ? ` (max price $${cmd.maxPrice})` : ''}...`);
         const result = await previewBuy(cmd.slug, cmd.outcome, cmd.amount, cmd.maxPrice);
-        await msg.channel.send({ embeds: [buildTradeEmbed({ ...cmd, market: cmd.slug }, result, true)] });
+        const summary = formatTradeSummary({ ...cmd, market: cmd.slug }, result, true);
+        await msg.channel.send({ embeds: [buildEmbedFromSummary(summary)] });
         break;
       }
 
@@ -470,7 +592,8 @@ client.on('messageCreate', async (msg) => {
         const title = first.title || first.question || first.name || slug;
         await msg.channel.send(`Found: **${title}** (slug: \`${slug}\`). Previewing buy ${cmd.outcome} for $${cmd.amount}...`);
         const previewResult = await previewBuy(slug, cmd.outcome, cmd.amount, cmd.maxPrice);
-        await msg.channel.send({ embeds: [buildTradeEmbed({ ...cmd, slug }, previewResult, true)] });
+        const summary = formatTradeSummary({ ...cmd, slug }, previewResult, true);
+        await msg.channel.send({ embeds: [buildEmbedFromSummary(summary)] });
         break;
       }
 
@@ -479,7 +602,8 @@ client.on('messageCreate', async (msg) => {
         const sellStr = cmd.sellAmount === 'max' ? 'all' : `${cmd.sellAmount} shares`;
         await msg.reply(`Executing: sell ${sellStr} of ${cmd.outcome} on \`${cmd.slug}\`${cmd.preview ? ' (preview)' : ''}...`);
         const result = await sellShares(cmd.slug, cmd.outcome, cmd.sellAmount, cmd.preview);
-        await msg.channel.send({ embeds: [buildTradeEmbed({ ...cmd, market: cmd.slug, outcome: cmd.outcome, amount: cmd.sellAmount }, result, cmd.preview)] });
+        const summary = formatTradeSummary({ ...cmd, market: cmd.slug, outcome: cmd.outcome, amount: cmd.sellAmount }, result, cmd.preview);
+        await msg.channel.send({ embeds: [buildEmbedFromSummary(summary)] });
         break;
       }
 
@@ -501,7 +625,8 @@ client.on('messageCreate', async (msg) => {
         const sellStr = cmd.sellAmount === 'max' ? 'all' : `${cmd.sellAmount} shares`;
         await msg.channel.send(`Found: **${title}** (slug: \`${slug}\`). Selling ${sellStr} of ${cmd.outcome}${cmd.preview ? ' (preview)' : ''}...`);
         const sellResult = await sellShares(slug, cmd.outcome, cmd.sellAmount, cmd.preview);
-        await msg.channel.send({ embeds: [buildTradeEmbed({ ...cmd, slug, market: cmd.market, outcome: cmd.outcome, amount: cmd.sellAmount }, sellResult, cmd.preview)] });
+        const summary = formatTradeSummary({ ...cmd, slug, market: cmd.market, outcome: cmd.outcome, amount: cmd.sellAmount }, sellResult, cmd.preview);
+        await msg.channel.send({ embeds: [buildEmbedFromSummary(summary)] });
         break;
       }
     }
