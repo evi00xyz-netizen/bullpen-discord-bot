@@ -14,7 +14,7 @@ const {
   BULLPEN_HOME,
   BULLPEN_ENV = 'production',
   BULLPEN_USE_WSL = 'false',
-  DEFAULT_BUY_AMOUNT = '2',
+  DEFAULT_BUY_AMOUNT = '2.25',
   CONFIRM_TIMEOUT = '30',
 } = process.env;
 
@@ -39,7 +39,7 @@ function fmtPrice(price) {
   return (Math.round(parseFloat(price) * 100) / 100).toFixed(2);
 }
 
-// --- Round display value to max 4 decimals (for shares, potential, etc) ---
+// --- Round display value to max 4 decimals ---
 function fmtDisplay(value, decimals = 4) {
   const n = parseFloat(value);
   if (isNaN(n)) return String(value);
@@ -157,7 +157,6 @@ async function searchMarket(query) {
 }
 
 // --- Preview buy (no money moves) ---
-// --max-price is OPTIONAL — only pass it if user specified one
 async function previewBuy(slug, outcome, amount, maxPrice) {
   const args = ['polymarket', 'buy', slug, outcome, fmtAmount(amount)];
   if (maxPrice) args.push('--max-price', fmtPrice(maxPrice));
@@ -500,12 +499,6 @@ function buildEmbedFromSummary(summary) {
   return embed;
 }
 
-// --- Check if error is the CLOB precision error ---
-function isPrecisionError(result) {
-  const text = (result.stderr || result.stdout || '').toLowerCase();
-  return text.includes('invalid amounts') || text.includes('max accuracy') || text.includes('2 decimals') || text.includes('6 decimals');
-}
-
 // --- Interactive buy: preview, wait for "y", then execute ---
 async function doBuyWithConfirm(msg, slug, outcome, amount, maxPrice, marketLabel) {
   await msg.channel.sendTyping();
@@ -536,18 +529,7 @@ async function doBuyWithConfirm(msg, slug, outcome, amount, maxPrice, marketLabe
 
     if (response.content.trim().toLowerCase() === 'y' || response.content.trim().toLowerCase() === 'yes') {
       await msg.channel.send('⏳ Executing trade...');
-
-      // Execute with original amount — no amount reduction
-      let execResult = await executeBuy(slug, outcome, amount, maxPrice);
-
-      // If precision error AND we passed --max-price, retry WITHOUT it
-      // The --max-price flag can cause the CLOB to compute ugly share counts
-      if (!execResult.ok && isPrecisionError(execResult) && maxPrice) {
-        console.log('Precision error with --max-price, retrying without it...');
-        await msg.channel.send('⚠️ Retrying without price limit...');
-        execResult = await executeBuy(slug, outcome, amount, null);
-      }
-
+      const execResult = await executeBuy(slug, outcome, amount, maxPrice);
       const execEmbed = buildTradeEmbed({ slug, market: marketLabel, outcome, amount }, execResult);
       await msg.channel.send({ embeds: [execEmbed] });
     } else {
