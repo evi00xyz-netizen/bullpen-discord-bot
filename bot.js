@@ -14,7 +14,7 @@ const {
   BULLPEN_HOME,
   BULLPEN_ENV = 'production',
   BULLPEN_USE_WSL = 'false',
-  DEFAULT_BUY_AMOUNT = '2.25',
+  DEFAULT_BUY_AMOUNT = '2',
   CONFIRM_TIMEOUT = '30',
 } = process.env;
 
@@ -39,8 +39,8 @@ function fmtPrice(price) {
   return (Math.round(parseFloat(price) * 100) / 100).toFixed(2);
 }
 
-// --- Round display value to max 4 decimals ---
-function fmtDisplay(value, decimals = 4) {
+// --- Round display value to max 2 decimals (shares, potential, spread, etc) ---
+function fmtDisplay(value, decimals = 2) {
   const n = parseFloat(value);
   if (isNaN(n)) return String(value);
   return parseFloat(n.toFixed(decimals)).toString();
@@ -264,10 +264,10 @@ function buildPreviewEmbed(cmd, result) {
     { name: 'Amount', value: amount !== 'N/A' ? `$${fmtDisplay(amount, 2)}` : `$${fmtAmount(cmd.amount)}`, inline: true },
   );
 
-  if (info.price) embed.addFields({ name: 'Price', value: `${fmtDisplay(info.price, 4)}¢`, inline: true });
-  if (info.shares) embed.addFields({ name: 'Est. Shares', value: fmtDisplay(info.shares, 4), inline: true });
-  if (info.potential) embed.addFields({ name: 'Potential', value: `$${fmtDisplay(info.potential, 4)}`, inline: true });
-  if (info.spread) embed.addFields({ name: 'Spread', value: `${fmtDisplay(info.spread, 4)}¢`, inline: true });
+  if (info.price) embed.addFields({ name: 'Price', value: `${fmtDisplay(info.price, 2)}¢`, inline: true });
+  if (info.shares) embed.addFields({ name: 'Est. Shares', value: fmtDisplay(info.shares, 2), inline: true });
+  if (info.potential) embed.addFields({ name: 'Potential', value: `$${fmtDisplay(info.potential, 2)}`, inline: true });
+  if (info.spread) embed.addFields({ name: 'Spread', value: `${fmtDisplay(info.spread, 2)}¢`, inline: true });
 
   embed.setFooter({ text: `Type "y" to confirm — or anything else to cancel (${confirmTimeoutSec}s timeout)` });
 
@@ -306,9 +306,9 @@ function buildTradeEmbed(cmd, result) {
     { name: 'Spent', value: amount !== 'N/A' ? `$${fmtDisplay(amount, 2)}` : `$${fmtAmount(cmd.amount)}`, inline: true },
   );
 
-  if (info.shares) embed.addFields({ name: 'Shares', value: fmtDisplay(info.shares, 4), inline: true });
-  if (info.price) embed.addFields({ name: 'Fill Price', value: `${fmtDisplay(info.price, 4)}¢`, inline: true });
-  if (info.potential) embed.addFields({ name: 'Potential', value: `$${fmtDisplay(info.potential, 4)}`, inline: true });
+  if (info.shares) embed.addFields({ name: 'Shares', value: fmtDisplay(info.shares, 2), inline: true });
+  if (info.price) embed.addFields({ name: 'Fill Price', value: `${fmtDisplay(info.price, 2)}¢`, inline: true });
+  if (info.potential) embed.addFields({ name: 'Potential', value: `$${fmtDisplay(info.potential, 2)}`, inline: true });
   if (info.orderId) embed.addFields({ name: 'Order ID', value: `\`${String(info.orderId).slice(0, 50)}\``, inline: true });
 
   return embed;
@@ -344,8 +344,8 @@ function buildSellEmbed(cmd, result, isPreview) {
     { name: 'Status', value: isPreview ? 'Preview' : 'Filled', inline: true },
   );
 
-  if (info.shares) embed.addFields({ name: 'Shares', value: fmtDisplay(info.shares, 4), inline: true });
-  if (info.price) embed.addFields({ name: 'Price', value: `${fmtDisplay(info.price, 4)}¢`, inline: true });
+  if (info.shares) embed.addFields({ name: 'Shares', value: fmtDisplay(info.shares, 2), inline: true });
+  if (info.price) embed.addFields({ name: 'Price', value: `${fmtDisplay(info.price, 2)}¢`, inline: true });
   if (info.amount) embed.addFields({ name: 'Received', value: `$${fmtDisplay(info.amount, 2)}`, inline: true });
 
   return embed;
@@ -424,7 +424,7 @@ function formatPositionsSummary(result) {
     const value = p?.value || p?.current_value || p?.cost || 'N/A';
     const pnl = p?.pnl || p?.profit || p?.realized_pnl || null;
 
-    let line = `**${market}**\n${outcome} | ${fmtDisplay(shares, 4)} shares`;
+    let line = `**${market}**\n${outcome} | ${fmtDisplay(shares, 2)} shares`;
     if (value !== 'N/A') line += ` | $${fmtDisplay(value, 2)}`;
     if (pnl !== null) line += ` | PnL: $${fmtDisplay(pnl, 2)}`;
 
