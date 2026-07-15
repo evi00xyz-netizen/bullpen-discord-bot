@@ -35,7 +35,7 @@ function fmtAmount(amount) {
   return roundAmount(amount).toFixed(2);
 }
 
-// --- Round price to 2 decimal places (prevents taker amount precision overflow) ---
+// --- Round price to 2 decimal places ---
 function roundPrice(price) {
   return Math.round(parseFloat(price) * 100) / 100;
 }
@@ -43,6 +43,97 @@ function roundPrice(price) {
 // --- Format price as string with exactly 2 decimals ---
 function fmtPrice(price) {
   return roundPrice(price).toFixed(2);
+}
+
+// --- Find a USDC amount (2 decimals) where shares = amount/price has <= 6 decimals ---
+// This prevents the CLOB "invalid amounts" precision rejection
+function findCleanAmount(targetAmount, price) {
+  if (!price || price <= 0 || !isFinite(price)) return null;
+
+  // Check if original amount works
+  let shares = targetAmount / price;
+  let rounded = Math.round(shares * 1e6) / 1e6;
+  if (Math.abs(rounded - shares) < 1e-9) {
+    console.log(`Clean amount found: $${targetAmount.toFixed(2)} → ${shares} shares (exact)`);
+    return targetAmount;
+  }
+
+  // Try nearby amounts (±$2.00 in $0.01 increments)
+  for (let delta = 0.01; delta <= 2.00; delta += 0.01) {
+    for (const sign of [-1, 1]) {
+      const amt = Math.round((targetAmount + sign * delta) * 100) / 100;
+      if (amt <= 0) continue;
+      shares = amt / price;
+      rounded = Math.round(shares * 1e6) / 1e6;
+      if (Math.abs(rounded - shares) < 1e-9) {
+        console.log(`Clean amount found: $${amt.toFixed(2)} → ${rounded} shares (delta=${sign * delta})`);
+        return amt;
+      }
+    }
+  }
+
+  // Try wider range
+  for (let delta = 2.01; delta <= 10.00; delta += 0.01) {
+    for (const sign of [-1, 1]) {
+      const amt = Math.round((targetAmount + sign * delta) * 100) / 100;
+      if (amt <= 0) continue;
+      shares = amt / price;
+      rounded = Math.round(shares * 1e6) / 1e6;
+      if (Math.abs(rounded - shares) < 1e-9) {
+        console.log(`Clean amount found: $${amt.toFixed(2)} → ${rounded} shares (delta=${sign * delta})`);
+        return amt;
+      }
+    }
+  }
+
+  console.log(`No clean amount found for $${targetAmount} at price ${price}`);
+  return null;
+}
+
+// --- Parse price from preview output (handles cents, dollars, Polymarket 0-1 format) ---
+function parsePriceFromOutput(stdout) {
+  const data = parseBullpenResult(stdout);
+  if (data) {
+    // Try various JSON fields
+    let p = data.price || data.avg_price || data.fill_price || data.execution_price || data.best_ask || data.ask || data.best_price;
+    if (p !== undefined && p !== null) {
+      p = parseFloat(p);
+      if (!isNaN(p) && p > 0) {
+        // If price looks like cents (e.g., 0.885 means 0.885 cents = $0.00885)
+        // Polymarket prices are 0-1 where 1 = $1 = 100 cents
+        // If p > 1, it's likely in cents → convert to dollars
+        // If p < 1, it could be Polymarket terms (0-1) or cents
+        // The preview showed "0.885¢" which means 0.885 cents = $0.00885
+        // But the JSON might store it as 0.00885 (Polymarket terms) or 0.885 (cents)
+        // We'll check: if p < 0.01, it's likely already in Polymarket terms
+        // If p >= 0.01 and p < 1, it could be cents (0.885 cents) or Polymarket (0.885 = 88.5 cents)
+        // The ¢ symbol in the text output suggests cents
+        // Let's check the text output for ¢ symbol
+        const text = stdout || '';
+        if (text.includes('¢') && p < 1) {
+          // Price is in cents, convert to dollars
+          return p / 100;
+        }
+        // Otherwise assume Polymarket terms (0-1)
+        return p;
+      }
+    }
+  }
+
+  // Parse from text
+  const text = stdout || '';
+  // Look for "Price: 0.885¢" pattern
+  const centsMatch = text.match(/Price:?\s*([\d.]+)\s*¢/i);
+  if (centsMatch) {
+    return parseFloat(centsMatch[1]) / 100; // cents to dollars
+  }
+  // Look for "Price: $0.88" or "Price: 0.88" pattern
+  const dollarMatch = text.match(/Price:?\s*\$?([\d.]+)/i);
+  if (dollarMatch) {
+    return parseFloat(dollarMatch[1]);
+  }
+
+  return null;
 }
 
 // --- Auto-detect bullpen binary path ---
@@ -155,28 +246,9 @@ async function searchMarket(query) {
   }
 }
 
-// --- Get current market price ---
-async function getMarketPrice(slug, outcome) {
-  const { ok, stdout } = await runBullpen([
-    'polymarket', 'price', slug, outcome, '--output', 'json',
-  ]);
-  if (!ok) return null;
-  const data = parseBullpenResult(stdout);
-  if (data) {
-    const price = data.price || data.best_ask || data.ask || data.best_price || null;
-    if (price !== null) return parseFloat(price);
-  }
-  // try parsing from text
-  const m = stdout.match(/price:?\s*\$?([\d.]+)/i);
-  if (m) return parseFloat(m[1]);
-  return null;
-}
-
 // --- Preview buy (no money moves) ---
-// Always pass --max-price rounded to 2 decimals to prevent CLOB precision errors
 async function previewBuy(slug, outcome, amount, maxPrice) {
   const args = ['polymarket', 'buy', slug, outcome, fmtAmount(amount)];
-  // Always include max-price — use provided (rounded) or default
   const price = maxPrice ? fmtPrice(maxPrice) : DEFAULT_MAX_PRICE;
   args.push('--max-price', price);
   args.push('--preview', '--output', 'json');
@@ -186,7 +258,6 @@ async function previewBuy(slug, outcome, amount, maxPrice) {
 // --- Execute buy (real trade) ---
 async function executeBuy(slug, outcome, amount, maxPrice) {
   const args = ['polymarket', 'buy', slug, outcome, fmtAmount(amount)];
-  // Always include max-price — use provided (rounded) or default
   const price = maxPrice ? fmtPrice(maxPrice) : DEFAULT_MAX_PRICE;
   args.push('--max-price', price);
   args.push('--yes', '--output', 'json');
@@ -522,7 +593,13 @@ function buildEmbedFromSummary(summary) {
   return embed;
 }
 
-// --- Interactive buy: preview, wait for "y", then execute ---
+// --- Check if error is the CLOB precision error ---
+function isPrecisionError(result) {
+  const text = (result.stderr || result.stdout || '').toLowerCase();
+  return text.includes('invalid amounts') || text.includes('max accuracy') || text.includes('2 decimals') || text.includes('6 decimals');
+}
+
+// --- Interactive buy: preview, wait for "y", then execute with precision fix ---
 async function doBuyWithConfirm(msg, slug, outcome, amount, maxPrice, marketLabel) {
   await msg.channel.sendTyping();
   const previewResult = await previewBuy(slug, outcome, amount, maxPrice);
@@ -533,6 +610,10 @@ async function doBuyWithConfirm(msg, slug, outcome, amount, maxPrice, marketLabe
   if (!previewResult.ok) {
     return;
   }
+
+  // Extract price from preview for precision fix
+  const previewPrice = parsePriceFromOutput(previewResult.stdout);
+  console.log(`Preview price parsed: ${previewPrice} (for amount $${amount})`);
 
   await msg.channel.send(`Type **y** to confirm this trade, or anything else to cancel (${confirmTimeoutSec}s timeout)...`);
 
@@ -552,7 +633,28 @@ async function doBuyWithConfirm(msg, slug, outcome, amount, maxPrice, marketLabe
 
     if (response.content.trim().toLowerCase() === 'y' || response.content.trim().toLowerCase() === 'yes') {
       await msg.channel.send('⏳ Executing trade...');
-      const execResult = await executeBuy(slug, outcome, amount, maxPrice);
+
+      // First attempt with original amount
+      let execResult = await executeBuy(slug, outcome, amount, maxPrice);
+
+      // If precision error, find a clean amount and retry
+      if (!execResult.ok && isPrecisionError(execResult) && previewPrice) {
+        console.log(`Precision error detected. Finding clean amount for price ${previewPrice}...`);
+        const cleanAmount = findCleanAmount(roundAmount(amount), previewPrice);
+
+        if (cleanAmount && cleanAmount !== roundAmount(amount)) {
+          await msg.channel.send(`⚠️ Adjusting amount to $${fmtAmount(cleanAmount)} for clean order precision...`);
+          execResult = await executeBuy(slug, outcome, cleanAmount, maxPrice);
+        } else if (!cleanAmount) {
+          // If no clean amount found, try rounding shares manually by using integer amount
+          const intAmount = Math.ceil(amount);
+          if (intAmount !== Math.round(amount)) {
+            await msg.channel.send(`⚠️ Trying $${intAmount.toFixed(2)} instead...`);
+            execResult = await executeBuy(slug, outcome, intAmount, maxPrice);
+          }
+        }
+      }
+
       const execEmbed = buildTradeEmbed({ slug, market: marketLabel, outcome, amount }, execResult);
       await msg.channel.send({ embeds: [execEmbed] });
     } else {
