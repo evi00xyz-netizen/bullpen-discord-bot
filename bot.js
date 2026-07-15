@@ -165,19 +165,19 @@ function parseBullpenResult(stdout) {
   }
 }
 
-// --- Extract preview info from bullpen output (JSON or text) ---
-function extractPreviewInfo(stdout) {
+// --- Extract info from bullpen output (JSON or text) ---
+function extractTradeInfo(stdout) {
   const data = parseBullpenResult(stdout);
   if (data) {
     return {
-      price: data.price || data.avg_price || data.fill_price || null,
-      amount: data.amount || data.size || data.cost || data.usdc || null,
-      shares: data.shares || data.fill_amount || data.filled || data.est_shares || data.estimated_shares || null,
+      price: data.price || data.avg_price || data.fill_price || data.execution_price || null,
+      amount: data.amount || data.size || data.cost || data.usdc || data.spent || null,
+      shares: data.shares || data.fill_amount || data.filled || data.est_shares || data.estimated_shares || data.amount_bought || null,
       potential: data.potential || data.potential_payout || data.payout || null,
       spread: data.spread || null,
       market: data.market || data.market_slug || data.slug || null,
       outcome: data.outcome || data.side || null,
-      orderId: data.order_id || data.id || data.tx || null,
+      orderId: data.order_id || data.id || data.tx || data.tx_hash || null,
       status: data.status || null,
       raw: data,
     };
@@ -206,10 +206,10 @@ function extractPreviewInfo(stdout) {
   };
 }
 
-// --- Format preview embed ---
+// --- Build preview embed ---
 function buildPreviewEmbed(cmd, result) {
   const embed = new EmbedBuilder().setTimestamp();
-  const info = extractPreviewInfo(result.stdout);
+  const info = extractTradeInfo(result.stdout);
 
   if (!result.ok) {
     let errMsg = 'Unknown error';
@@ -235,7 +235,7 @@ function buildPreviewEmbed(cmd, result) {
   embed.addFields(
     { name: 'Market', value: `\`${String(market).slice(0, 100)}\``, inline: true },
     { name: 'Outcome', value: String(outcome), inline: true },
-    { name: 'Amount', value: amount !== 'N/A' ? `$${amount}` : 'N/A', inline: true },
+    { name: 'Amount', value: amount !== 'N/A' ? `$${amount}` : `$${cmd.amount}`, inline: true },
   );
 
   if (info.price) embed.addFields({ name: 'Price', value: `${info.price}¢`, inline: true });
@@ -246,10 +246,10 @@ function buildPreviewEmbed(cmd, result) {
   return embed;
 }
 
-// --- Format trade execution embed ---
+// --- Build trade execution embed ---
 function buildTradeEmbed(cmd, result) {
   const embed = new EmbedBuilder().setTimestamp();
-  const info = extractPreviewInfo(result.stdout);
+  const info = extractTradeInfo(result.stdout);
 
   if (!result.ok) {
     let errMsg = 'Unknown error';
@@ -275,7 +275,7 @@ function buildTradeEmbed(cmd, result) {
   embed.addFields(
     { name: 'Market', value: `\`${String(market).slice(0, 100)}\``, inline: true },
     { name: 'Outcome', value: String(outcome), inline: true },
-    { name: 'Spent', value: amount !== 'N/A' ? `$${amount}` : 'N/A', inline: true },
+    { name: 'Spent', value: amount !== 'N/A' ? `$${amount}` : `$${cmd.amount}`, inline: true },
   );
 
   if (info.shares) embed.addFields({ name: 'Shares', value: String(info.shares), inline: true });
@@ -286,10 +286,10 @@ function buildTradeEmbed(cmd, result) {
   return embed;
 }
 
-// --- Format sell embed ---
+// --- Build sell embed ---
 function buildSellEmbed(cmd, result, isPreview) {
   const embed = new EmbedBuilder().setTimestamp();
-  const info = extractPreviewInfo(result.stdout);
+  const info = extractTradeInfo(result.stdout);
 
   if (!result.ok) {
     let errMsg = 'Unknown error';
@@ -491,25 +491,25 @@ function buildEmbedFromSummary(summary) {
   return embed;
 }
 
-// --- Two-phase buy: preview first, then execute ---
-// Shows preview embed, waits 3 seconds, then executes and shows result embed
+// --- Two-phase buy: try preview first, then execute ---
+// If preview fails, skip it and execute directly so the trade always goes through
 async function doBuyWithPreview(msg, slug, outcome, amount, maxPrice, marketLabel) {
-  // Phase 1: Preview
+  // Phase 1: Try preview
   await msg.channel.sendTyping();
   const previewResult = await previewBuy(slug, outcome, amount, maxPrice);
 
-  if (!previewResult.ok) {
-    const embed = buildPreviewEmbed({ slug, market: marketLabel, outcome, amount }, previewResult);
-    await msg.channel.send({ embeds: [embed] });
-    return;
+  if (previewResult.ok) {
+    // Preview succeeded — show it, then execute
+    const previewEmbed = buildPreviewEmbed({ slug, market: marketLabel, outcome, amount }, previewResult);
+    await msg.channel.send({ embeds: [previewEmbed] });
+    await msg.channel.send('⏳ Executing trade...');
+  } else {
+    // Preview failed — log it but don't block the trade
+    console.log('Preview failed, executing directly:', previewResult.stderr || previewResult.stdout);
+    await msg.channel.send('⏳ Executing trade...');
   }
 
-  // Show preview embed
-  const previewEmbed = buildPreviewEmbed({ slug, market: marketLabel, outcome, amount }, previewResult);
-  await msg.channel.send({ embeds: [previewEmbed] });
-
-  // Phase 2: Execute
-  await msg.channel.send('⏳ Executing trade...');
+  // Phase 2: Execute (always runs)
   const execResult = await executeBuy(slug, outcome, amount, maxPrice);
   const execEmbed = buildTradeEmbed({ slug, market: marketLabel, outcome, amount }, execResult);
   await msg.channel.send({ embeds: [execEmbed] });
@@ -534,7 +534,7 @@ client.on('messageCreate', async (msg) => {
           '`Buy "Rinderknech" on Polymarket: https://polymarket.com/event/... for $10` — Buy $10',
           '`Buy $10 of "Rinderknech" on Polymarket: https://polymarket.com/event/...` — Buy $10',
           '',
-          '**Buying (always previews first, then executes):**',
+          '**Buying (previews first, then executes):**',
           '`!buy "Market Name" YES 10` — Preview then buy $10 of YES',
           '`!buy "Market Name" YES 10 --max-price 0.20` — Buy with max price limit',
           '`!buy "Rinderknech" https://polymarket.com/event/... 10` — Buy by Polymarket URL',
@@ -626,16 +626,16 @@ client.on('messageCreate', async (msg) => {
           break;
         }
 
-        await msg.reply(`Found ${extracted.type} slug: \`${extracted.slug}\`. Previewing buy **${cmd.outcome}** for $${cmd.amount}${cmd.maxPrice ? ` (max price $${cmd.maxPrice})` : ''}...`);
+        await msg.reply(`Found ${extracted.type} slug: \`${extracted.slug}\`. Buying **${cmd.outcome}** for $${cmd.amount}${cmd.maxPrice ? ` (max price $${cmd.maxPrice})` : ''}...`);
 
         // Try direct slug first
         const previewResult = await previewBuy(extracted.slug, cmd.outcome, cmd.amount, cmd.maxPrice);
 
         if (previewResult.ok) {
-          // Preview looks good — do two-phase buy
+          // Preview worked — do two-phase buy with this slug
           await doBuyWithPreview(msg, extracted.slug, cmd.outcome, cmd.amount, cmd.maxPrice, extracted.slug);
         } else {
-          // Direct slug failed — try searching
+          // Direct slug preview failed — try searching for the market
           await msg.channel.send('Direct slug failed, searching for specific market...');
           const searchResult = await searchMarket(extracted.slug);
           if (searchResult.ok && searchResult.markets.length > 0) {
@@ -648,7 +648,9 @@ client.on('messageCreate', async (msg) => {
             await msg.channel.send(`Found market: **${title}** (slug: \`${slug}\`)`);
             await doBuyWithPreview(msg, slug, cmd.outcome, cmd.amount, cmd.maxPrice, title);
           } else {
-            await msg.channel.send({ embeds: [new EmbedBuilder().setColor(0xff0000).setTimestamp().setTitle('Market Not Found').setDescription(`Could not find a market for \`${extracted.slug}\`. Try \`!buy-slug ${extracted.slug} ${cmd.outcome} ${cmd.amount}\` manually.`)] });
+            // Search also failed — try executing directly with the original slug as last resort
+            await msg.channel.send('Search failed too. Attempting direct execution...');
+            await doBuyWithPreview(msg, extracted.slug, cmd.outcome, cmd.amount, cmd.maxPrice, extracted.slug);
           }
         }
         break;
